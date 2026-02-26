@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyc
+*.pyd
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/
+
+# Database
+*.sqlite3
+db.sqlite3
+
+# IDE / Editor
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.DS_Store
+
+# Django
+staticfiles/
+media/
+
+# Test / Utility scripts (not needed in production)
+add_dummy_multipart.py
+generate_test_bulk.py
+trim_entries.py
+test_bulk_upload_data.xlsx
+
+# Byte-compiled / optimized
+*.pot
+
+# Misc
+notes.txt
+*.xlsx

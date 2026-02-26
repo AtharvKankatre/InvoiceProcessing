@@ -1,0 +1,7 @@
+__pycache__
+*.log
+*.pot
+.env
+notes.txt
+*.pyo
+*.pyc

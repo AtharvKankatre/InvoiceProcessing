@@ -1,0 +1,69 @@
+{
+  "parts": [
+    {
+      "retail": "RETAIL-A400",
+      "sale": "PART-A400",
+      "company": "Honda",
+      "available": -22858
+    },
+    {
+      "retail": "RETAIL-B500",
+      "sale": "PART-B500",
+      "company": "Maruti",
+      "available": 16637
+    },
+    {
+      "retail": "RETAIL-X100",
+      "sale": "PART-X100",
+      "company": "Cooper Corp",
+      "available": 41075
+    },
+    {
+      "retail": "RETAIL-X100-H",
+      "sale": "PART-X100",
+      "company": "Hyundai",
+      "available": 40498
+    },
+    {
+      "retail": "RETAIL-Y200",
+      "sale": "PART-Y200",
+      "company": "Global Supplies",
+      "available": 36770
+    },
+    {
+      "retail": "RETAIL-Y200-T",
+      "sale": "PART-Y200",
+      "company": "Tata Motors",
+      "available": 37055
+    },
+    {
+      "retail": "RETAIL-Z300",
+      "sale": "PART-Z300",
+      "company": "Techno Parts Ltd",
+      "available": 17820
+    }
+  ],
+  "existing_invoices": [
+    "BULK-TEST-004",
+    "UT-879432-005",
+    "UT-879432-003",
+    "UT-879432-008",
+    "TEST-PERFECT-003",
+    "UT-879432-011",
+    "UT-879432-002",
+    "PERFECT-INV-009",
+    "TEST-INV-A01",
+    "TEST-ZEROQTY-008",
+    "BULK-TEST-013",
+    "BULK-V2-005",
+    "TEST-NOQTY-007",
+    "BULK-TEST-003",
+    "UT-879432-014",
+    "UT-879432-007",
+    "UT-879432-012",
+    "TEST-PERFECT-005",
+    "TEST-NOCONV-10",
+    "UT-879432-001"
+  ],
+  "customer_count": 7
+}

@@ -1,0 +1,505 @@
+/* Container Layout */
+.balance-history-container {
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    background: linear-gradient(135deg, #f8fafc 0%, #edf2f7 100%);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+        'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+        sans-serif;
+    color: #1e293b;
+    overflow-y: auto;
+}
+
+/* Header */
+.balance-history-header {
+    background: white;
+    padding: 1rem 2rem;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.05);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    position: sticky;
+    top: 0;
+    z-index: 50;
+}
+
+.balance-history-header h1 {
+    font-size: 1.5rem;
+    font-weight: 700;
+    color: #0f172a;
+    margin: 0;
+}
+
+.header-actions {
+    display: flex;
+    gap: 1rem;
+}
+
+/* Main Content Area */
+.balance-history-main {
+    flex: 1;
+    padding: 2rem 2rem 6rem 2rem;
+    /* Added bottom padding */
+    max-width: 1000px;
+    margin: 0 auto;
+    width: 100%;
+}
+
+.balance-history-content {
+    display: flex;
+    flex-direction: column;
+    gap: 2rem;
+}
+
+/* Invoice Selector */
+.invoice-selector {
+    background: white;
+    padding: 1.5rem;
+    border-radius: 16px;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.02);
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    border: 1px solid #e2e8f0;
+}
+
+.invoice-selector label {
+    font-weight: 600;
+    color: #64748b;
+    font-size: 0.875rem;
+    margin-bottom: 0.5rem;
+    display: block;
+}
+
+.invoice-selector select {
+    padding: 0.75rem;
+    border: 1px solid #cbd5e1;
+    border-radius: 8px;
+    font-size: 1rem;
+    width: 100%;
+    max-width: 500px;
+    background-color: #f8fafc;
+    transition: all 0.2s;
+}
+
+.invoice-selector select:focus {
+    outline: none;
+    border-color: #3b82f6;
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+}
+
+/* Summary Cards */
+.summary-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: 1.5rem;
+}
+
+.summary-card {
+    background: white;
+    padding: 1.5rem;
+    border-radius: 16px;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.02);
+    border: 1px solid #e2e8f0;
+    transition: transform 0.2s, box-shadow 0.2s;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    min-width: 0;
+    /* Important for flex child truncation */
+}
+
+.summary-card:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 10px 15px rgba(0, 0, 0, 0.05);
+}
+
+.summary-card h3 {
+    font-size: 0.75rem;
+    color: #64748b;
+    margin: 0 0 1rem 0;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.summary-card .value {
+    font-size: 2.25rem;
+    font-weight: 800;
+    color: #0f172a;
+    line-height: 1.1;
+    margin-bottom: 1rem;
+    word-break: break-all;
+    /* Prevent overflow for massive numbers */
+}
+
+.summary-card-footer {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    padding-top: 0.75rem;
+    border-top: 1px solid #f1f5f9;
+}
+
+.summary-card .sub-value {
+    font-size: 0.85rem;
+    color: #475569;
+    font-weight: 500;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    white-space: nowrap;
+    /* Keep currency symbol with number */
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.summary-card.highlight .value {
+    color: #3b82f6;
+}
+
+.summary-card.warning .value {
+    color: #f59e0b;
+}
+
+.summary-card.success .value {
+    color: #10b981;
+}
+
+/* TIMELINE STYLES */
+
+.timeline-section-title {
+    font-size: 1.25rem;
+    font-weight: 700;
+    margin-bottom: 2rem;
+    color: #334155;
+    padding-left: 1rem;
+    border-left: 4px solid #3b82f6;
+}
+
+.timeline-container {
+    position: relative;
+    padding: 1rem 0;
+    max-width: 800px;
+    margin: 0 auto;
+    /* Center the timeline within the main area */
+}
+
+.timeline-item {
+    display: flex;
+    gap: 2rem;
+    position: relative;
+    padding-bottom: 3rem;
+}
+
+.timeline-item:last-child {
+    padding-bottom: 0;
+}
+
+/* Left column: Date */
+.timeline-date-col {
+    width: 120px;
+    text-align: right;
+    padding-top: 0.5rem;
+    flex-shrink: 0;
+}
+
+.timeline-date {
+    font-weight: 700;
+    color: #334155;
+    font-size: 0.95rem;
+    display: block;
+    margin-bottom: 0.25rem;
+}
+
+.timeline-time {
+    color: #94a3b8;
+    font-size: 0.8rem;
+    display: block;
+    font-weight: 500;
+}
+
+/* Center column: Line & Marker */
+.timeline-marker-col {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    width: 40px;
+    position: relative;
+    flex-shrink: 0;
+}
+
+.timeline-line {
+    width: 2px;
+    background-color: #e2e8f0;
+    flex-grow: 1;
+    min-height: 50px;
+    position: absolute;
+    top: 40px;
+    /* Start below the icon circle */
+    bottom: -20px;
+    /* Connect to next item */
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 0;
+}
+
+.timeline-item:last-child .timeline-line {
+    display: none;
+}
+
+.timeline-icon-wrapper {
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    background-color: white;
+    border: 2px solid #e2e8f0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 10;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+    transition: all 0.3s ease;
+}
+
+.timeline-item:hover .timeline-icon-wrapper {
+    transform: scale(1.1);
+    border-color: #3b82f6;
+    box-shadow: 0 4px 8px rgba(59, 130, 246, 0.2);
+}
+
+.timeline-icon-wrapper.created {
+    background-color: #ecfdf5;
+    border-color: #10b981;
+    color: #059669;
+}
+
+.timeline-icon-wrapper.consumption {
+    background-color: #fff1f2;
+    border-color: #f43f5e;
+    color: #e11d48;
+}
+
+.timeline-icon-wrapper.status {
+    background-color: #eff6ff;
+    border-color: #3b82f6;
+    color: #2563eb;
+}
+
+/* Right column: Content Card */
+.timeline-content-col {
+    flex: 1;
+}
+
+.timeline-card {
+    background: white;
+    border-radius: 12px;
+    padding: 1.5rem;
+    box-shadow: 0 2px 5px rgba(0, 0, 0, 0.03);
+    border: 1px solid #f1f5f9;
+    transition: all 0.2s ease;
+    position: relative;
+}
+
+/* Arrow pointing left to the marker */
+.timeline-card::before {
+    content: '';
+    position: absolute;
+    left: -8px;
+    top: 20px;
+    width: 16px;
+    height: 16px;
+    background: white;
+    border-left: 1px solid #e2e8f0;
+    /* Match card border */
+    border-bottom: 1px solid #e2e8f0;
+    transform: rotate(45deg);
+    border-radius: 0 0 0 2px;
+}
+
+.timeline-item:hover .timeline-card {
+    box-shadow: 0 10px 25px rgba(0, 0, 0, 0.08);
+    border-color: #cbd5e1;
+    transform: translateX(4px);
+}
+
+.timeline-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1rem;
+    border-bottom: 1px solid #f1f5f9;
+    padding-bottom: 0.75rem;
+}
+
+.timeline-title {
+    font-size: 1.1rem;
+    font-weight: 700;
+    color: #1e293b;
+    margin: 0;
+}
+
+.timeline-badge {
+    padding: 0.35rem 0.85rem;
+    border-radius: 9999px;
+    font-size: 0.75rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.timeline-badge.created {
+    background-color: #ecfdf5;
+    color: #059669;
+}
+
+.timeline-badge.consumption {
+    background-color: #fff1f2;
+    color: #e11d48;
+}
+
+.timeline-badge.active {
+    background-color: #eff6ff;
+    color: #2563eb;
+}
+
+.timeline-details {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 1.25rem;
+    font-size: 0.9rem;
+}
+
+.detail-group label {
+    display: block;
+    color: #64748b;
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    margin-bottom: 0.25rem;
+}
+
+.detail-group span {
+    font-weight: 500;
+    color: #334155;
+    font-size: 1rem;
+}
+
+.detail-group.highlight span {
+    color: #2563eb;
+    font-weight: 700;
+}
+
+.detail-group.negative span {
+    color: #e11d48;
+    font-weight: 700;
+}
+
+/* Additional States */
+.loading-state,
+.error-state,
+.empty-state {
+    background: white;
+    border-radius: 16px;
+    padding: 3rem;
+    text-align: center;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.02);
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+    .balance-history-header {
+        flex-direction: column;
+        gap: 1rem;
+        align-items: stretch;
+        padding: 1rem;
+    }
+
+    .balance-history-header h1 {
+        text-align: center;
+        font-size: 1.25rem;
+    }
+
+    .header-actions {
+        width: 100%;
+    }
+
+    .header-actions button {
+        width: 100%;
+        justify-content: center;
+    }
+
+    .balance-history-main {
+        padding: 1rem;
+    }
+
+    .timeline-container {
+        padding-left: 0;
+    }
+
+    .timeline-item {
+        gap: 0.75rem;
+        padding-bottom: 2rem;
+    }
+
+    /* Stack date above content or hide left col and show date in card? 
+       Let's keep left col but very small and rely on card content if needed.
+       Actually, standard timeline often keeps icon left. */
+    .timeline-date-col {
+        width: 60px;
+        text-align: right;
+    }
+
+    .timeline-date {
+        font-size: 0.75rem;
+        line-height: 1.2;
+    }
+
+    .timeline-time {
+        font-size: 0.7rem;
+    }
+
+    .timeline-card {
+        padding: 1rem;
+    }
+
+    .timeline-details {
+        grid-template-columns: 1fr;
+        /* Stack details single column on very small screens */
+        gap: 0.75rem;
+    }
+}
+
+@media (max-width: 480px) {
+    .summary-cards {
+        grid-template-columns: 1fr;
+    }
+
+    .timeline-item {
+        gap: 0.5rem;
+    }
+
+    .timeline-date-col {
+        width: 50px;
+        font-size: 0.7rem;
+    }
+
+    .timeline-icon-wrapper {
+        width: 32px;
+        height: 32px;
+    }
+
+    .timeline-line {
+        top: 32px;
+        left: 50%;
+    }
+
+    .timeline-marker-col {
+        width: 32px;
+    }
+
+    .timeline-title {
+        font-size: 1rem;
+    }
+}
