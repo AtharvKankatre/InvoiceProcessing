@@ -149,9 +149,9 @@ def _process_single_row(row_num, cleaned, user_instance):
     entry_date = cleaned["date"]
     retail_invoice_number = cleaned["retail_invoice_number"]
 
-    # â”€â”€ Duplicate check â”€â”€
-    if InvoiceEntry.objects.filter(retail_invoice_number=retail_invoice_number).exists():
-        return False, f"retail_invoice_number '{retail_invoice_number}' already exists"
+    # ── Duplicate check (invoice + part combo) ──
+    if InvoiceEntry.objects.filter(retail_invoice_number=retail_invoice_number, part_number=part_number).exists():
+        return False, f"retail_invoice_number '{retail_invoice_number}' with part '{part_number}' already exists"
 
     # â”€â”€ Part mapping â”€â”€
     part_mapping = InvoiceRetailPartMap.objects.filter(
@@ -647,17 +647,19 @@ class BulkPreviewView(APIView):
                 is_valid = False
                 errors["format"] = format_error
             
-            # Application Logic Validation (Duplicate)
+            # Application Logic Validation (Duplicate — invoice + part combo)
             inv_num = str(row_data.get("retail_invoice_number") or "").strip()
+            part_for_dupe = str(row_data.get("part_number") or "").strip()
+            dupe_key = f"{inv_num}__{part_for_dupe}"
             if inv_num:
-                if inv_num in seen_invoice_numbers:
+                if dupe_key in seen_invoice_numbers:
                     is_valid = False
-                    errors["retail_invoice_number"] = f"Duplicate within file (row {seen_invoice_numbers[inv_num]})"
-                elif InvoiceEntry.objects.filter(retail_invoice_number=inv_num).exists():
+                    errors["retail_invoice_number"] = f"Duplicate within file (row {seen_invoice_numbers[dupe_key]})"
+                elif InvoiceEntry.objects.filter(retail_invoice_number=inv_num, part_number=part_for_dupe).exists():
                     is_valid = False
                     errors["retail_invoice_number"] = "Already exists in database"
                 else:
-                    seen_invoice_numbers[inv_num] = row_num
+                    seen_invoice_numbers[dupe_key] = row_num
             else:
                  is_valid = False
                  errors["retail_invoice_number"] = "Missing"
@@ -751,8 +753,8 @@ class BulkCommitView(APIView):
                     entry_date = cleaned["date"]
                     retail_invoice_number = cleaned["retail_invoice_number"]
                     
-                    if InvoiceEntry.objects.filter(retail_invoice_number=retail_invoice_number).exists():
-                        raise Exception(f"Row {row_id}: retail_invoice_number '{retail_invoice_number}' already exists in database.")
+                    if InvoiceEntry.objects.filter(retail_invoice_number=retail_invoice_number, part_number=part_number).exists():
+                        raise Exception(f"Row {row_id}: retail_invoice_number '{retail_invoice_number}' with part '{part_number}' already exists in database.")
                         
                     part_mapping = InvoiceRetailPartMap.objects.filter(retail_part_number=part_number).first()
                     sale_part_number = part_mapping.sale_part_number if part_mapping else part_number

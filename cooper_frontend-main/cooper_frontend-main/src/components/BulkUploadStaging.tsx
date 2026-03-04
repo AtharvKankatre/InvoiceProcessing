@@ -87,14 +87,16 @@ const BulkUploadStaging: React.FC<BulkUploadStagingProps> = ({ file, onClose, on
             }
 
 
-            // ── Retail Invoice Number: duplicate check ──
+            // ── Retail Invoice Number: duplicate check (invoice + part combo) ──
             const invNum = String(newRow.data.retail_invoice_number || '').trim();
+            const partNum = String(newRow.data.part_number || '').trim();
+            const dupeKey = `${invNum}__${partNum}`;
             if (!invNum) {
                 newRow.errors.retail_invoice_number = 'Required';
-            } else if (seen.has(invNum)) {
+            } else if (seen.has(dupeKey)) {
                 newRow.errors.retail_invoice_number = 'Duplicate in file';
             } else {
-                seen.add(invNum);
+                seen.add(dupeKey);
             }
 
             // ── Manual selection mismatch check ──
@@ -129,39 +131,30 @@ const BulkUploadStaging: React.FC<BulkUploadStagingProps> = ({ file, onClose, on
         });
 
         // ═══════════════════════════════════════════════════════
-        // PASS 2: Set remaining & individual stock checks
+        // PASS 2: Sequential stock check — track remaining per part
         // ═══════════════════════════════════════════════════════
+        const cumulativeConsumed: Record<string, number> = {};
         const result = validated.map(row => {
             const foundKey = (row as any)._foundKey as string | undefined;
             delete (row as any)._foundKey;
 
             if (foundKey && currentInventory[foundKey]) {
                 const totalAvail = currentInventory[foundKey].available_qty;
-                const totalConsumed = totalConsumedByPart[foundKey] || 0;
-                const globalRemaining = Math.max(0, totalAvail - totalConsumed);
+                const alreadyConsumed = cumulativeConsumed[foundKey] || 0;
+                const remaining = totalAvail - alreadyConsumed;
 
-                row.dynamic_avail = globalRemaining;
-
-                // Individual check: does THIS row's qty alone exceed total stock?
                 const rowQty = Number(row.data.qty);
                 if (!row.errors.qty && !row.errors.part_number && rowQty > 0) {
-                    if (rowQty > totalAvail) {
-                        row.errors.qty = `Exceeds total stock (${totalAvail} available)`;
+                    if (rowQty > remaining) {
+                        row.errors.qty = `Exceeds total stock (${remaining} available)`;
                         row.is_valid = false;
-                    } else if (totalConsumed > totalAvail) {
-                        // Batch is over-consumed but this row alone is OK.
-                        // Only warn — don't block (the excessive row above will be blocked).
-                        // Check: if removing THIS row's qty still exceeds, it's not the culprit.
-                        const consumedByOthers = totalConsumed - rowQty;
-                        if (consumedByOthers >= totalAvail) {
-                            // Others already exceed — this row is NOT the problem
-                            // Just show warning, don't block
-                        } else {
-                            // This row pushes it over — it IS partly the culprit
-                            // But only if removing it would fix the issue
-                        }
+                    } else {
+                        // Only consume stock if row is valid
+                        cumulativeConsumed[foundKey] = alreadyConsumed + rowQty;
                     }
                 }
+
+                row.dynamic_avail = Math.max(0, totalAvail - (cumulativeConsumed[foundKey] || 0));
             }
 
             return row;

@@ -21,11 +21,12 @@ class StockLedgerService:
         for entry in entry_qs:
             cons = entry.consumptions.all()
             if cons.exists():
-                # Use consumption data (more accurate)
+                # Use consumption data for qty and fc (more accurate)
                 for c in cons:
                     total_qty += c.consumed_qty or 0
                     total_fc += c.fc_value or Decimal(0)
-                    total_inr += c.taxable_value or Decimal(0)
+                # INR comes from the InvoiceEntry (consumption.taxable_value is USD, not INR)
+                total_inr += entry.inr_total or Decimal(0)
             else:
                 # Fallback to raw InvoiceEntry
                 total_qty += entry.qty or 0
@@ -97,7 +98,7 @@ class StockLedgerService:
                     customer_name=party_name,
                     date__lt=start_date
                 ).aggregate(
-                    total_qty=Coalesce(Sum('qty'), 0),
+                    total_qty=Coalesce(Sum('invoice_qty'), 0),
                     total_fc=Coalesce(Sum('dollar_total'), Decimal(0), output_field=DecimalField()),
                     total_inr=Coalesce(Sum('inr_total'), Decimal(0), output_field=DecimalField())
                 )
@@ -128,7 +129,7 @@ class StockLedgerService:
                 customer_name=party_name,
                 **date_filter
             ).aggregate(
-                total_qty=Coalesce(Sum('qty'), 0),
+                total_qty=Coalesce(Sum('invoice_qty'), 0),
                 total_fc=Coalesce(Sum('dollar_total'), Decimal(0), output_field=DecimalField()),
                 total_inr=Coalesce(Sum('inr_total'), Decimal(0), output_field=DecimalField())
             )
@@ -270,7 +271,7 @@ class StockLedgerService:
                 inc_open = Invoice.objects.filter(
                     customer_name=party_name, date__lt=start_date
                 ).aggregate(
-                    qty=Coalesce(Sum('qty'), 0),
+                    qty=Coalesce(Sum('invoice_qty'), 0),
                     fc=Coalesce(Sum('dollar_total'), Decimal(0), output_field=DecimalField()),
                     inr=Coalesce(Sum('inr_total'), Decimal(0), output_field=DecimalField()),
                 )
@@ -293,7 +294,7 @@ class StockLedgerService:
                 inc_filter['date__lte'] = end_date
 
             inc_period = Invoice.objects.filter(**inc_filter).aggregate(
-                qty=Coalesce(Sum('qty'), 0),
+                qty=Coalesce(Sum('invoice_qty'), 0),
                 fc=Coalesce(Sum('dollar_total'), Decimal(0), output_field=DecimalField()),
                 inr=Coalesce(Sum('inr_total'), Decimal(0), output_field=DecimalField()),
             )
@@ -355,7 +356,7 @@ class StockLedgerService:
                     if cons.exists():
                         entry_qty = sum(c.consumed_qty or 0 for c in cons)
                         entry_fc = float(sum(c.fc_value or Decimal(0) for c in cons))
-                        entry_inr = float(sum(c.taxable_value or Decimal(0) for c in cons))
+                        entry_inr = float(entry.inr_total or 0)
                     else:
                         entry_qty = entry.qty
                         entry_fc = float(entry.usd_total or 0)
@@ -493,7 +494,7 @@ class StockLedgerService:
         opening_out = {}
         if start_date:
             prev_inc = Invoice.objects.filter(date__lt=start_date).values('part_number', 'customer_name').annotate(
-                qty=Coalesce(Sum('qty'), 0),
+                qty=Coalesce(Sum('invoice_qty'), 0),
                 fc=Coalesce(Sum('dollar_total'), Decimal(0), output_field=DecimalField()),
                 inr=Coalesce(Sum('inr_total'), Decimal(0), output_field=DecimalField())
             )
@@ -517,7 +518,8 @@ class StockLedgerService:
                             opening_out[(canonical, cust)] = {'qty': 0, 'fc': Decimal(0), 'inr': Decimal(0)}
                         opening_out[(canonical, cust)]['qty'] += c.consumed_qty or 0
                         opening_out[(canonical, cust)]['fc'] += c.fc_value or Decimal(0)
-                        opening_out[(canonical, cust)]['inr'] += c.taxable_value or Decimal(0)
+                    # INR from InvoiceEntry (taxable_value is USD, not INR)
+                    opening_out[(canonical, cust)]['inr'] += entry.inr_total or Decimal(0)
                 else:
                     if (canonical, cust) not in opening_out:
                         opening_out[(canonical, cust)] = {'qty': 0, 'fc': Decimal(0), 'inr': Decimal(0)}
@@ -528,7 +530,7 @@ class StockLedgerService:
 
         period_inc = {}
         period_inc_qs = Invoice.objects.filter(**inc_filter).values('part_number', 'customer_name').annotate(
-            qty=Coalesce(Sum('qty'), 0),
+            qty=Coalesce(Sum('invoice_qty'), 0),
             fc=Coalesce(Sum('dollar_total'), Decimal(0), output_field=DecimalField()),
             inr=Coalesce(Sum('inr_total'), Decimal(0), output_field=DecimalField())
         )
