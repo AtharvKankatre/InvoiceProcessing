@@ -66,8 +66,8 @@ const BulkUploadStaging: React.FC<BulkUploadStagingProps> = ({ file, onClose, on
             if (!newRow.data.date) newRow.errors.date = 'Required';
 
             const qtyNum = Number(newRow.data.qty);
-            if (isNaN(qtyNum) || qtyNum <= 0) {
-                newRow.errors.qty = 'Must be > 0';
+            if (isNaN(qtyNum) || qtyNum === 0) {
+                newRow.errors.qty = 'Must be non-zero';
             } else if (!Number.isInteger(qtyNum)) {
                 newRow.errors.qty = 'Must be a whole number';
             }
@@ -114,7 +114,7 @@ const BulkUploadStaging: React.FC<BulkUploadStagingProps> = ({ file, onClose, on
 
             if (!newRow.errors.part_number && part) {
                 if (foundKey && currentInventory[foundKey]) {
-                    if (!newRow.errors.qty && qtyNum > 0) {
+                    if (!newRow.errors.qty && qtyNum !== 0) {
                         totalConsumedByPart[foundKey] = (totalConsumedByPart[foundKey] || 0) + qtyNum;
                     }
                 } else {
@@ -144,12 +144,11 @@ const BulkUploadStaging: React.FC<BulkUploadStagingProps> = ({ file, onClose, on
                 const remaining = totalAvail - alreadyConsumed;
 
                 const rowQty = Number(row.data.qty);
-                if (!row.errors.qty && !row.errors.part_number && rowQty > 0) {
-                    if (rowQty > remaining) {
+                if (!row.errors.qty && !row.errors.part_number && rowQty !== 0) {
+                    if (rowQty > 0 && rowQty > remaining) {
                         row.errors.qty = `Exceeds total stock (${remaining} available)`;
                         row.is_valid = false;
                     } else {
-                        // Only consume stock if row is valid
                         cumulativeConsumed[foundKey] = alreadyConsumed + rowQty;
                     }
                 }

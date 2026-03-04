@@ -48,7 +48,7 @@ class InvoiceEntryConsumption(models.Model):
         "retail.InvoiceEntry", on_delete=models.CASCADE, related_name="consumptions"
     )
     invoice = models.ForeignKey("Invoice", on_delete=models.CASCADE)
-    consumed_qty = models.PositiveIntegerField()
+    consumed_qty = models.IntegerField()
     selling_price_inr = models.DecimalField(max_digits=30, decimal_places=15, default=0)
 
     profit_absolute = models.DecimalField(max_digits=30, decimal_places=15, default=0)

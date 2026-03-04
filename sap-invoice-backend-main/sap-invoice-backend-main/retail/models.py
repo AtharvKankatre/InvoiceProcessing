@@ -6,7 +6,7 @@ class InvoiceEntry(models.Model):
     # invoice_number = models.CharField(max_length=50)
     part_number = models.CharField(max_length=100)
     date = models.DateField()
-    qty = models.PositiveIntegerField()
+    qty = models.IntegerField()
     usd_rate = models.DecimalField(max_digits=20, decimal_places=4)
     usd_total = models.DecimalField(max_digits=20, decimal_places=4)
     inr_rate = models.DecimalField(max_digits=20, decimal_places=4)

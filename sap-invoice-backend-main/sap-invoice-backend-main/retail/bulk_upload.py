@@ -101,8 +101,8 @@ def _validate_row(row_num, row_data):
 
     qty_raw = row_data.get("qty")
     qty = _to_decimal(qty_raw, '1')
-    if qty is None or qty <= 0:
-        errors.append("qty must be a positive number")
+    if qty is None or qty == 0:
+        errors.append("qty must be a non-zero number")
 
     usd_rate = _to_decimal(row_data.get("usd_rate"))
     if usd_rate is None:
@@ -135,8 +135,9 @@ def _validate_row(row_num, row_data):
 
 def _process_single_row(row_num, cleaned, user_instance):
     """
-    Process one validated row using FIFO logic.
-    This mirrors InvoiceEntryCreateView.create but without manual invoice selection.
+    Process one validated row.
+    - Positive qty: FIFO consumption (dispatch stock from oldest invoices)
+    - Negative qty: LIFO return (add stock back to most recent invoices)
 
     Returns (success_bool, message_string).
     """
@@ -145,15 +146,15 @@ def _process_single_row(row_num, cleaned, user_instance):
     qty_to_consume = cleaned["qty"]
     conversion_rate = cleaned["conversion_rate"]
     retail_dollar_rate = cleaned["usd_rate"]
-    retail_inr_rate = cleaned["inr_rate"]  # auto-calculated: usd_rate Ã— conversion_rate
+    retail_inr_rate = cleaned["inr_rate"]
     entry_date = cleaned["date"]
     retail_invoice_number = cleaned["retail_invoice_number"]
 
-    # ── Duplicate check (invoice + part combo) ──
+    # Duplicate check (invoice + part combo)
     if InvoiceEntry.objects.filter(retail_invoice_number=retail_invoice_number, part_number=part_number).exists():
         return False, f"retail_invoice_number '{retail_invoice_number}' with part '{part_number}' already exists"
 
-    # â”€â”€ Part mapping â”€â”€
+    # Part mapping
     part_mapping = InvoiceRetailPartMap.objects.filter(
         retail_part_number=part_number
     ).first()
@@ -161,33 +162,48 @@ def _process_single_row(row_num, cleaned, user_instance):
     if part_mapping:
         sale_part_number = part_mapping.sale_part_number
     else:
-        # Fallback: assume retail part = sale part
         sale_part_number = part_number
 
-    # â”€â”€ FIFO selection â”€â”€
-    matching_invoices = Invoice.objects.filter(
-        part_number=sale_part_number,
-        qty__gt=0,
-    ).order_by("date", "id")
-
-    total_available = sum(inv.qty for inv in matching_invoices)
-    if total_available < qty_to_consume:
-        return False, f"Not enough stock. Requested: {qty_to_consume}, Available: {total_available}"
-
-    # â”€â”€ Consume from invoices (FIFO) â”€â”€
-    qty_remaining = qty_to_consume
     consumed_records = []
 
-    for invoice in matching_invoices:
-        if qty_remaining == 0:
-            break
+    if qty_to_consume > 0:
+        # POSITIVE QTY: Normal FIFO consumption (dispatch)
+        matching_invoices = Invoice.objects.filter(
+            part_number=sale_part_number,
+            qty__gt=0,
+        ).order_by("date", "id")
 
-        consumed_qty = min(qty_remaining, Decimal(invoice.qty))
-        qty_remaining -= consumed_qty
-        invoice.qty -= int(consumed_qty)
+        total_available = sum(inv.qty for inv in matching_invoices)
+        if total_available < qty_to_consume:
+            return False, f"Not enough stock. Requested: {qty_to_consume}, Available: {total_available}"
+
+        qty_remaining = qty_to_consume
+        for invoice in matching_invoices:
+            if qty_remaining == 0:
+                break
+            consumed_qty = min(qty_remaining, Decimal(invoice.qty))
+            qty_remaining -= consumed_qty
+            invoice.qty -= int(consumed_qty)
+            invoice.created_by = user_instance
+            invoice.save()
+            consumed_records.append((invoice, consumed_qty))
+    else:
+        # NEGATIVE QTY: Credit note / return (LIFO)
+        abs_qty = abs(qty_to_consume)
+        matching_invoices = Invoice.objects.filter(
+            part_number=sale_part_number,
+        ).order_by("-date", "-id")  # LIFO: most recent first
+
+        if not matching_invoices.exists():
+            return False, f"No invoices found for part '{sale_part_number}' to return stock to"
+
+        # Add all returned qty to the most recent invoice
+        invoice = matching_invoices.first()
+        invoice.qty += int(abs_qty)
         invoice.created_by = user_instance
         invoice.save()
-        consumed_records.append((invoice, consumed_qty))
+        consumed_records.append((invoice, -abs_qty))  # Negative consumed_qty
+
 
     # â”€â”€ Build consumption data (same calculations as InvoiceEntryCreateView) â”€â”€
     consumption_data_list = []
@@ -677,10 +693,14 @@ class BulkPreviewView(APIView):
                     already_consumed = consumed_qty_tracker.get(part_num, 0)
                     remaining = total_avail - already_consumed
                     
-                    if req_qty and req_qty > remaining:
+                    if req_qty and req_qty > 0 and req_qty > remaining:
+                        # Only check stock for positive qty (dispatches)
                         is_valid = False
                         errors["qty"] = f"Not enough stock. Need: {req_qty}, Only {remaining} left (total: {total_avail})"
-                    elif req_qty:
+                    elif req_qty and req_qty > 0:
+                        consumed_qty_tracker[part_num] = already_consumed + int(req_qty)
+                    elif req_qty and req_qty < 0:
+                        # Negative qty (return) reduces cumulative consumption
                         consumed_qty_tracker[part_num] = already_consumed + int(req_qty)
             
             results.append({
@@ -759,48 +779,65 @@ class BulkCommitView(APIView):
                     part_mapping = InvoiceRetailPartMap.objects.filter(retail_part_number=part_number).first()
                     sale_part_number = part_mapping.sale_part_number if part_mapping else part_number
                     
-                    # Consume Logic (Custom or FIFO)
+                    # Consume Logic (Custom/FIFO for positive, LIFO for negative)
                     consumed_records = []
                     
-                    if selected_invoices and isinstance(selected_invoices, list) and len(selected_invoices) > 0:
-                        total_selected_qty = Decimal('0')
-                        for selection in selected_invoices:
-                            inv_id = selection.get("invoice_id")
-                            sel_qty = Decimal(str(selection.get("qty", 0)))
-                            if not inv_id or sel_qty <= 0:
-                                continue
-                            try:
-                                invoice = Invoice.objects.get(id=inv_id, part_number=sale_part_number, qty__gt=0)
-                            except Invoice.DoesNotExist:
-                                raise Exception(f"Row {row_id}: Invoice ID {inv_id} not found or empty.")
+                    if qty_to_consume > 0:
+                        # POSITIVE QTY: Dispatch (Custom selection or FIFO)
+                        if selected_invoices and isinstance(selected_invoices, list) and len(selected_invoices) > 0:
+                            total_selected_qty = Decimal('0')
+                            for selection in selected_invoices:
+                                inv_id = selection.get("invoice_id")
+                                sel_qty = Decimal(str(selection.get("qty", 0)))
+                                if not inv_id or sel_qty <= 0:
+                                    continue
+                                try:
+                                    invoice = Invoice.objects.get(id=inv_id, part_number=sale_part_number, qty__gt=0)
+                                except Invoice.DoesNotExist:
+                                    raise Exception(f"Row {row_id}: Invoice ID {inv_id} not found or empty.")
+                                    
+                                if sel_qty > invoice.qty:
+                                    raise Exception(f"Row {row_id}: Invoice {invoice.invoice_number} has only {invoice.qty} available.")
+                                    
+                                invoice.qty -= int(sel_qty)
+                                invoice.created_by = user_instance
+                                invoice.save()
+                                consumed_records.append((invoice, sel_qty))
+                                total_selected_qty += sel_qty
                                 
-                            if sel_qty > invoice.qty:
-                                raise Exception(f"Row {row_id}: Invoice {invoice.invoice_number} has only {invoice.qty} available.")
+                            if total_selected_qty != qty_to_consume:
+                                raise Exception(f"Row {row_id}: Selected quantity ({total_selected_qty}) != Requested quantity ({qty_to_consume}).")
+                        else:
+                            # FIFO
+                            matching_invoices = Invoice.objects.filter(part_number=sale_part_number, qty__gt=0).order_by("date", "id")
+                            total_available = sum(inv.qty for inv in matching_invoices)
+                            if total_available < qty_to_consume:
+                                raise Exception(f"Row {row_id}: Not enough stock. Requested {qty_to_consume}, Available {total_available}.")
                                 
-                            invoice.qty -= int(sel_qty)
-                            invoice.created_by = user_instance
-                            invoice.save()
-                            consumed_records.append((invoice, sel_qty))
-                            total_selected_qty += sel_qty
-                            
-                        if total_selected_qty != qty_to_consume:
-                            raise Exception(f"Row {row_id}: Selected quantity ({total_selected_qty}) != Requested quantity ({qty_to_consume}).")
+                            qty_remaining = qty_to_consume
+                            for invoice in matching_invoices:
+                                if qty_remaining == 0: break
+                                consumed_qty = min(qty_remaining, Decimal(invoice.qty))
+                                qty_remaining -= consumed_qty
+                                invoice.qty -= int(consumed_qty)
+                                invoice.created_by = user_instance
+                                invoice.save()
+                                consumed_records.append((invoice, consumed_qty))
                     else:
-                        # FIFO
-                        matching_invoices = Invoice.objects.filter(part_number=sale_part_number, qty__gt=0).order_by("date", "id")
-                        total_available = sum(inv.qty for inv in matching_invoices)
-                        if total_available < qty_to_consume:
-                            raise Exception(f"Row {row_id}: Not enough stock. Requested {qty_to_consume}, Available {total_available}.")
-                            
-                        qty_remaining = qty_to_consume
-                        for invoice in matching_invoices:
-                            if qty_remaining == 0: break
-                            consumed_qty = min(qty_remaining, Decimal(invoice.qty))
-                            qty_remaining -= consumed_qty
-                            invoice.qty -= int(consumed_qty)
-                            invoice.created_by = user_instance
-                            invoice.save()
-                            consumed_records.append((invoice, consumed_qty))
+                        # NEGATIVE QTY: Credit note / return (LIFO)
+                        abs_qty = abs(qty_to_consume)
+                        matching_invoices = Invoice.objects.filter(
+                            part_number=sale_part_number,
+                        ).order_by("-date", "-id")
+                        
+                        if not matching_invoices.exists():
+                            raise Exception(f"Row {row_id}: No invoices found for part '{sale_part_number}' to return stock to.")
+                        
+                        invoice = matching_invoices.first()
+                        invoice.qty += int(abs_qty)
+                        invoice.created_by = user_instance
+                        invoice.save()
+                        consumed_records.append((invoice, -abs_qty))
                             
                     # Calculate values
                     consumption_data_list = []
