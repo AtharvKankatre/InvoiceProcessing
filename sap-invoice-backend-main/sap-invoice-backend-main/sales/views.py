@@ -467,7 +467,7 @@ def invoice_balance_history(request):
                 history = []
                 
                 # Guard against NULL invoice_qty (some invoices may not have this set)
-                inv_qty = float(selected_invoice.invoice_qty) if selected_invoice.invoice_qty is not None else 0.0
+                inv_qty = float(selected_invoice.invoice_qty) if selected_invoice.invoice_qty is not None else float(selected_invoice.qty or 0)
 
                 # 1. Creation Event
                 history.append({
@@ -618,9 +618,8 @@ class PartHistoryViewSet(viewsets.ViewSet):
                  for p_num, p_txns in grouped_txns.items():
                      p_bals = calculator.calculate_running_balance(p_txns)
                      transactions_with_balance.extend(p_bals)
-                 
-                 # Final sort by Part Number then Date
-                 transactions_with_balance.sort(key=lambda x: (x.get('part_number', ''), x['date']))
+                 # Final sort by Part Number then system created_at time
+                 transactions_with_balance.sort(key=lambda x: (x.get('part_number', ''), x.get('created_at') or datetime.min))
             
 
 
@@ -1030,21 +1029,21 @@ class StockLedgerViewSet(viewsets.ViewSet):
                     # Column order matching Sheet 1 (Stock Ledger):
                     # Identity → Opening → Shipment → Consumption (Despatch) → Closing
                     part_headers = [
-                        "Code No.", "Party Name", "Part Number",
+                        "Code No.", "Party Name", "Part Number", "Invoice No.",
                         "Opening Qty", "Opening FC", "Opening INR",
                         "Shipment Qty", "Shipment FC", "Shipment INR",
                         "Despatch Qty", "Despatch FC Value", "Despatch INR Value",
                         "Closing Qty", "Closing FC", "Closing INR",
                     ]
                     part_keys = [
-                        'Code No. Stock AC', 'Party Name', 'Part Number',
+                        'Code No. Stock AC', 'Party Name', 'Part Number', 'Invoice No.',
                         'Opening Qty', 'Opening FC', 'Opening INR',
                         'Shipment Qty', 'Shipment FC', 'Shipment INR',
                         'Qty', 'FC Value', 'INR Value',
                         'Closing Qty', 'Closing FC', 'Closing INR',
                     ]
                     part_col_widths = [
-                        14, 25, 18,
+                        14, 25, 18, 18,
                         12, 14, 14,
                         12, 14, 14,
                         12, 14, 14,
@@ -1056,6 +1055,9 @@ class StockLedgerViewSet(viewsets.ViewSet):
                         cell.font = header_font
                         cell.fill = header_fill
                         cell.alignment = Alignment(horizontal="center")
+
+                    invoice_detail_fill = PatternFill(start_color="E8DAEF", end_color="E8DAEF", fill_type="solid")  # Light lavender
+                    invoice_detail_font = Font(italic=True)
 
                     current_row = 2
                     for row_data in partwise_data:
@@ -1073,6 +1075,9 @@ class StockLedgerViewSet(viewsets.ViewSet):
                                 cell.font = bold_font
                                 cell.fill = cust_subtotal_fill
                                 cell.border = thin_border
+                            elif row_type == 'invoice_detail':
+                                cell.font = invoice_detail_font
+                                cell.fill = invoice_detail_fill
                             elif row_type == 'part_grand_total':
                                 cell.font = bold_font
                                 cell.fill = part_grand_fill
@@ -1087,7 +1092,7 @@ class StockLedgerViewSet(viewsets.ViewSet):
                 else:
                     # Create empty sheet if no data
                     pd.DataFrame(columns=[
-                        "Code No.", "Party Name", "Part Number",
+                        "Code No.", "Party Name", "Part Number", "Invoice No.",
                         "Opening Qty", "Opening FC", "Opening INR",
                         "Shipment Qty", "Shipment FC", "Shipment INR",
                         "Despatch Qty", "Despatch FC Value", "Despatch INR Value",

@@ -577,6 +577,7 @@ class StockLedgerService:
                 'Code No. Stock AC': '',
                 'Party Name': '',
                 'Part Number': f'{part}',
+                'Invoice No.': '',
                 'Qty': '', 'FC Value': '', 'INR Value': '', 'Date': '',
                 'Opening Qty': '', 'Opening FC': '', 'Opening INR': '',
                 'Shipment Qty': '', 'Shipment FC': '', 'Shipment INR': '',
@@ -630,6 +631,7 @@ class StockLedgerService:
                     'Code No. Stock AC': cust_code,
                     'Party Name': f'{cust} — Subtotal',
                     'Part Number': '',
+                    'Invoice No.': '',
                     'Qty': desp_qty,
                     'FC Value': float(desp_fc),
                     'INR Value': float(desp_inr),
@@ -644,12 +646,62 @@ class StockLedgerService:
                     'Closing FC': float(close_fc),
                     'Closing INR': float(close_inr),
                 })
+
+                # --- INVOICE-LEVEL CLOSING BREAKDOWN ---
+                # For each sales invoice of this (part, customer), calculate
+                # remaining stock = invoice_qty - sum(consumed_qty).
+                # Only show invoices that still have remaining stock.
+                inv_filter = {'part_number': part, 'customer_name': cust}
+                if end_date:
+                    inv_filter['date__lte'] = end_date
+
+                invoices_for_part_cust = Invoice.objects.filter(
+                    **inv_filter
+                ).order_by('date')
+
+                for inv in invoices_for_part_cust:
+                    inv_qty = inv.invoice_qty if inv.invoice_qty is not None else (inv.qty or 0)
+                    total_consumed = InvoiceEntryConsumption.objects.filter(
+                        invoice=inv
+                    ).aggregate(
+                        total=Coalesce(Sum('consumed_qty'), 0)
+                    )['total']
+                    remaining_qty = inv_qty - total_consumed
+
+                    if remaining_qty != 0:
+                        # Calculate closing FC and INR for this invoice
+                        # FC per unit = invoice dollar_rate
+                        # INR per unit = invoice inr_rate
+                        inv_closing_fc = float(remaining_qty * (inv.dollar_rate or Decimal(0)))
+                        inv_closing_inr = float(remaining_qty * (inv.inr_rate or Decimal(0)))
+
+                        result_rows.append({
+                            '_row_type': 'invoice_detail',
+                            'Code No. Stock AC': '',
+                            'Party Name': cust,
+                            'Part Number': part,
+                            'Invoice No.': inv.invoice_number,
+                            'Qty': '',
+                            'FC Value': '',
+                            'INR Value': '',
+                            'Date': '',
+                            'Opening Qty': '',
+                            'Opening FC': '',
+                            'Opening INR': '',
+                            'Shipment Qty': '',
+                            'Shipment FC': '',
+                            'Shipment INR': '',
+                            'Closing Qty': remaining_qty,
+                            'Closing FC': round(inv_closing_fc, 2),
+                            'Closing INR': round(inv_closing_inr, 2),
+                        })
                 
             result_rows.append({
                 '_row_type': 'part_grand_total',
                 'Code No. Stock AC': '',
                 'Party Name': '',
                 'Part Number': f'{part} — Grand Total',
+                'Invoice No.': '',
                 'Qty': part_grand_desp_qty,
                 'FC Value': float(part_grand_desp_fc),
                 'INR Value': float(part_grand_desp_inr),
@@ -663,6 +715,7 @@ class StockLedgerService:
             result_rows.append({
                 '_row_type': 'spacer',
                 'Code No. Stock AC': '', 'Party Name': '', 'Part Number': '',
+                'Invoice No.': '',
                 'Qty': '', 'FC Value': '', 'INR Value': '', 'Date': '',
                 'Opening Qty': '', 'Opening FC': '', 'Opening INR': '',
                 'Shipment Qty': '', 'Shipment FC': '', 'Shipment INR': '',

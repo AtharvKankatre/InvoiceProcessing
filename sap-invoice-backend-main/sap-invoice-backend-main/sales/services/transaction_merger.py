@@ -40,6 +40,7 @@ class TransactionMerger:
             'invoice_number',
             'date',
             'qty',
+            'invoice_qty',
             'customer_name',
             'customer_code',
             'created_at',
@@ -66,10 +67,12 @@ class TransactionMerger:
                 inr_rate = float(invoice['inr_rate'] or 0)
                 conv_rate = round(inr_rate / dollar_rate, 4) if dollar_rate > 0 else 0
             
+            actual_qty = invoice['invoice_qty'] if invoice.get('invoice_qty') is not None else invoice['qty']
+            
             transactions.append({
                 'date': invoice['date'],
                 'invoice_number': invoice['invoice_number'],
-                'qty': invoice['qty'],
+                'qty': actual_qty,
                 'type': 'INCOMING',
                 'created_at': invoice['created_at'],
                 'name': customer_name, # Standardized key 'name' for view
@@ -178,7 +181,7 @@ class TransactionMerger:
         # Combine both lists
         merged = incoming + outgoing
         
-        # Sort by date (ascending), then by created_at (ascending)
-        merged.sort(key=lambda x: (x['date'], x['created_at'] or datetime.min))
+        # Sort by exact chronological entry time instead of backdated manual 'date'
+        merged.sort(key=lambda x: x['created_at'] or datetime.min)
         
         return merged

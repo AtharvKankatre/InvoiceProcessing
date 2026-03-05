@@ -79,13 +79,6 @@ const BulkUploadStaging: React.FC<BulkUploadStagingProps> = ({ file, onClose, on
                 newRow.errors.usd_rate = 'Must be > 0';
             }
 
-            const convVal = Number(newRow.data.conversion_rate);
-            if (!newRow.data.conversion_rate || isNaN(convVal)) {
-                newRow.errors.conversion_rate = 'Required (number)';
-            } else if (convVal <= 0) {
-                newRow.errors.conversion_rate = 'Must be > 0';
-            }
-
 
             // ── Retail Invoice Number: duplicate check (invoice + part combo) ──
             const invNum = String(newRow.data.retail_invoice_number || '').trim();
@@ -421,7 +414,6 @@ const BulkUploadStaging: React.FC<BulkUploadStagingProps> = ({ file, onClose, on
                             <th>Date</th>
                             <th>Quantity</th>
                             <th>$ Rate</th>
-                            <th>Conv Rate</th>
                             <th>Retail Inv Number</th>
                             <th>Actions</th>
                         </tr>
@@ -487,16 +479,6 @@ const BulkUploadStaging: React.FC<BulkUploadStagingProps> = ({ file, onClose, on
                                             title={row.errors.usd_rate}
                                         />
                                         {row.errors.usd_rate && <div className="cell-error-msg">{row.errors.usd_rate}</div>}
-                                    </td>
-                                    <td>
-                                        <Input
-                                            type="number" step="0.01"
-                                            value={row.data.conversion_rate || ''}
-                                            onChange={(e) => handleCellChange(row.row_id, 'conversion_rate', e.target.value)}
-                                            className={row.errors.conversion_rate ? 'input-error' : ''}
-                                            title={row.errors.conversion_rate}
-                                        />
-                                        {row.errors.conversion_rate && <div className="cell-error-msg">{row.errors.conversion_rate}</div>}
                                     </td>
                                     <td>
                                         <Input

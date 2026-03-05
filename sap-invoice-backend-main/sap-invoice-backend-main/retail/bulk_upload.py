@@ -41,7 +41,6 @@ TEMPLATE_COLUMNS = [
     "date",
     "qty",
     "usd_rate",
-    "conversion_rate",
     "retail_invoice_number",
 ]
 
@@ -50,7 +49,6 @@ COLUMN_DESCRIPTIONS = [
     "Date (YYYY-MM-DD)",
     "Quantity to dispatch",
     "Selling USD rate per unit",
-    "INR/USD Conversion (FX) rate",
     "Retail Invoice Number (must be unique)",
 ]
 
@@ -108,10 +106,6 @@ def _validate_row(row_num, row_data):
     if usd_rate is None:
         errors.append("usd_rate is required and must be a number")
 
-    conversion_rate = _to_decimal(row_data.get("conversion_rate"))
-    if conversion_rate is None:
-        errors.append("conversion_rate is required and must be a number")
-
     retail_inv = str(row_data.get("retail_invoice_number") or "").strip()
     if not retail_inv:
         errors.append("retail_invoice_number is required")
@@ -119,16 +113,11 @@ def _validate_row(row_num, row_data):
     if errors:
         return None, f"Row {row_num}: {'; '.join(errors)}"
 
-    # Auto-calculate inr_rate = usd_rate Ã— conversion_rate
-    inr_rate = (usd_rate * conversion_rate).quantize(Decimal('0.0001'), rounding=ROUND_HALF_UP)
-
     return {
         "part_number": part_number,
         "date": row_date,
         "qty": qty,
         "usd_rate": usd_rate,
-        "inr_rate": inr_rate,
-        "conversion_rate": conversion_rate,
         "retail_invoice_number": retail_inv,
     }, None
 
@@ -144,9 +133,7 @@ def _process_single_row(row_num, cleaned, user_instance):
 
     part_number = cleaned["part_number"]
     qty_to_consume = cleaned["qty"]
-    conversion_rate = cleaned["conversion_rate"]
     retail_dollar_rate = cleaned["usd_rate"]
-    retail_inr_rate = cleaned["inr_rate"]
     entry_date = cleaned["date"]
     retail_invoice_number = cleaned["retail_invoice_number"]
 
@@ -205,11 +192,12 @@ def _process_single_row(row_num, cleaned, user_instance):
         consumed_records.append((invoice, -abs_qty))  # Negative consumed_qty
 
 
-    # â”€â”€ Build consumption data (same calculations as InvoiceEntryCreateView) â”€â”€
+    # â”€â”€ Build consumption data (using source invoice conversion rate) â”€â”€
     consumption_data_list = []
     total_usd = Decimal('0')
     total_inr = Decimal('0')
     total_qty = Decimal('0')
+    weighted_conv_sum = Decimal('0')
 
     for invoice, consumed_qty in consumed_records:
         inv_dollar_rate = _safe_decimal(invoice.dollar_rate)
@@ -224,14 +212,14 @@ def _process_single_row(row_num, cleaned, user_instance):
         taxable_value = base_value - dnd
         fc_value = taxable_value
 
-        # INR received vs cost
-        inr_received = consumed_qty * usd_rate * conversion_rate
+        # INR received vs cost (Using source invoice conversion rate instead of user-provided)
+        inr_received = consumed_qty * usd_rate * inv_conversion_rate
         inr_cost = consumed_qty * inv_dollar_rate * inv_conversion_rate
 
         # Profit decomposition
         profit_absolute = inr_received - inr_cost
-        selling_profit_inr = (usd_rate - inv_dollar_rate) * consumed_qty * conversion_rate
-        fx_profit = inv_dollar_rate * consumed_qty * (conversion_rate - inv_conversion_rate)
+        selling_profit_inr = (usd_rate - inv_dollar_rate) * consumed_qty * inv_conversion_rate
+        fx_profit = Decimal('0')  # Rate is the same, so FX profit is 0
         profit_fx_only = profit_absolute - selling_profit_inr - fx_profit
         selling_profit_usd = (usd_rate - inv_dollar_rate) * consumed_qty
 
@@ -252,12 +240,21 @@ def _process_single_row(row_num, cleaned, user_instance):
             "rate_sale_from_wh_per_unit": (inv_inr_rate / inv_conversion_rate).quantize(Decimal('0.01')) if inv_conversion_rate else Decimal('0'),
             "rate_sale_from_wh": retail_dollar_rate,
             "diff": ((inv_inr_rate / inv_conversion_rate) - retail_dollar_rate).quantize(Decimal('0.01')) if inv_conversion_rate else Decimal('0'),
-            "surcharge": (((inv_inr_rate / inv_conversion_rate) - retail_dollar_rate) * consumed_qty * conversion_rate).quantize(Decimal('0.01')) if inv_conversion_rate else Decimal('0'),
+            "surcharge": (((inv_inr_rate / inv_conversion_rate) - retail_dollar_rate) * consumed_qty * inv_conversion_rate).quantize(Decimal('0.01')) if inv_conversion_rate else Decimal('0'),
         })
 
         total_usd += inv_dollar_rate * consumed_qty
         total_inr += inv_inr_rate * consumed_qty
-        total_qty += consumed_qty
+        total_qty += abs(consumed_qty)
+        weighted_conv_sum += inv_conversion_rate * abs(consumed_qty)
+
+    # â”€â”€ Calculate weighted average conversion rate â”€â”€
+    if total_qty:
+        avg_conversion_rate = (weighted_conv_sum / total_qty).quantize(Decimal('0.0001'), rounding=ROUND_HALF_UP)
+    else:
+        avg_conversion_rate = Decimal('0')
+
+    retail_inr_rate = (retail_dollar_rate * avg_conversion_rate).quantize(Decimal('0.0001'), rounding=ROUND_HALF_UP)
 
     # â”€â”€ Create InvoiceEntry â”€â”€
     usd_total_final = (retail_dollar_rate * qty_to_consume).quantize(Decimal('0.01'))
@@ -271,7 +268,7 @@ def _process_single_row(row_num, cleaned, user_instance):
         usd_total=usd_total_final,
         inr_rate=retail_inr_rate,
         inr_total=inr_total_final,
-        conversion_rate=conversion_rate,
+        conversion_rate=avg_conversion_rate,
         retail_invoice_number=retail_invoice_number,
         created_by=user_instance,
     )
@@ -609,7 +606,7 @@ class BulkPreviewView(APIView):
                 row_dict['date'] = parsed.strftime('%Y-%m-%d') if parsed else row_dict['date']
                 
             # Decimal to string mapping
-            for key in ['qty', 'usd_rate', 'conversion_rate']:
+            for key in ['qty', 'usd_rate']:
                 if row_dict.get(key) is not None:
                     row_dict[key] = str(row_dict[key])
                     
@@ -767,9 +764,7 @@ class BulkCommitView(APIView):
                         
                     part_number = cleaned["part_number"]
                     qty_to_consume = cleaned["qty"]
-                    conversion_rate = cleaned["conversion_rate"]
                     retail_dollar_rate = cleaned["usd_rate"]
-                    retail_inr_rate = cleaned["inr_rate"]
                     entry_date = cleaned["date"]
                     retail_invoice_number = cleaned["retail_invoice_number"]
                     
@@ -839,8 +834,11 @@ class BulkCommitView(APIView):
                         invoice.save()
                         consumed_records.append((invoice, -abs_qty))
                             
-                    # Calculate values
+                    # Calculate values using source invoice conversion rate
                     consumption_data_list = []
+                    total_qty = Decimal('0')
+                    weighted_conv_sum = Decimal('0')
+                    
                     for invoice, consumed_qty in consumed_records:
                         inv_dollar_rate = _safe_decimal(invoice.dollar_rate)
                         inv_inr_rate = _safe_decimal(invoice.inr_rate)
@@ -851,12 +849,14 @@ class BulkCommitView(APIView):
                         base_value = consumed_qty * usd_rate
                         taxable_value = base_value - dnd
                         fc_value = taxable_value
-                        inr_received = consumed_qty * usd_rate * conversion_rate
+                        
+                        # INR rate depends on invoice's conversion rate
+                        inr_received = consumed_qty * usd_rate * inv_conversion_rate
                         inr_cost = consumed_qty * inv_dollar_rate * inv_conversion_rate
                         
                         profit_absolute = inr_received - inr_cost
-                        selling_profit_inr = (usd_rate - inv_dollar_rate) * consumed_qty * conversion_rate
-                        fx_profit = inv_dollar_rate * consumed_qty * (conversion_rate - inv_conversion_rate)
+                        selling_profit_inr = (usd_rate - inv_dollar_rate) * consumed_qty * inv_conversion_rate
+                        fx_profit = Decimal('0')  # Rate is the same, so FX profit is 0
                         profit_fx_only = profit_absolute - selling_profit_inr - fx_profit
                         selling_profit_usd = (usd_rate - inv_dollar_rate) * consumed_qty
                         
@@ -877,9 +877,20 @@ class BulkCommitView(APIView):
                             "rate_sale_from_wh_per_unit": (inv_inr_rate / inv_conversion_rate).quantize(Decimal('0.01')) if inv_conversion_rate else Decimal('0'),
                             "rate_sale_from_wh": retail_dollar_rate,
                             "diff": ((inv_inr_rate / inv_conversion_rate) - retail_dollar_rate).quantize(Decimal('0.01')) if inv_conversion_rate else Decimal('0'),
-                            "surcharge": (((inv_inr_rate / inv_conversion_rate) - retail_dollar_rate) * consumed_qty * conversion_rate).quantize(Decimal('0.01')) if inv_conversion_rate else Decimal('0'),
+                            "surcharge": (((inv_inr_rate / inv_conversion_rate) - retail_dollar_rate) * consumed_qty * inv_conversion_rate).quantize(Decimal('0.01')) if inv_conversion_rate else Decimal('0'),
                         })
                         
+                        total_qty += abs(consumed_qty)
+                        weighted_conv_sum += inv_conversion_rate * abs(consumed_qty)
+                        
+                    # Calculate weighted average conversion rate
+                    if total_qty:
+                        avg_conversion_rate = (weighted_conv_sum / total_qty).quantize(Decimal('0.0001'), rounding=ROUND_HALF_UP)
+                    else:
+                        avg_conversion_rate = Decimal('0')
+
+                    retail_inr_rate = (retail_dollar_rate * avg_conversion_rate).quantize(Decimal('0.0001'), rounding=ROUND_HALF_UP)
+
                     # Save InvoiceEntry
                     usd_total_final = (retail_dollar_rate * qty_to_consume).quantize(Decimal('0.01'))
                     inr_total_final = (retail_inr_rate * qty_to_consume).quantize(Decimal('0.01'))
@@ -887,7 +898,7 @@ class BulkCommitView(APIView):
                         part_number=part_number, date=entry_date, qty=int(qty_to_consume),
                         usd_rate=retail_dollar_rate, usd_total=usd_total_final,
                         inr_rate=retail_inr_rate, inr_total=inr_total_final,
-                        conversion_rate=conversion_rate, retail_invoice_number=retail_invoice_number,
+                        conversion_rate=avg_conversion_rate, retail_invoice_number=retail_invoice_number,
                         created_by=user_instance,
                     )
                     
