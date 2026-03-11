@@ -84,6 +84,35 @@ const PartHistoryPage: React.FC = () => {
         }
     };
 
+    const handleExportSelected = async () => {
+        if (!partNumber.trim()) {
+            setError('Please enter a part number first');
+            return;
+        }
+        try {
+            setLoading(true);
+            const blob = await apiService.exportPartHistory(
+                partNumber.trim(),
+                fromDate || undefined,
+                toDate || undefined
+            );
+
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `Part_History_${partNumber.trim()}_${new Date().toISOString().split('T')[0]}.xlsx`;
+            document.body.appendChild(a);
+            a.click();
+            window.URL.revokeObjectURL(url);
+            document.body.removeChild(a);
+        } catch (err) {
+            console.error('Export selected part failed:', err);
+            setError('Failed to export selected part history. Please try again.');
+        } finally {
+            setLoading(false);
+        }
+    };
+
     const handleKeyPress = (e: React.KeyboardEvent) => {
         if (e.key === 'Enter') {
             handleSearch();
@@ -126,6 +155,16 @@ const PartHistoryPage: React.FC = () => {
                         className="header-action-button dashboard-button"
                     >
                         Dashboard
+                    </button>
+                    <button
+                        onClick={handleExportSelected}
+                        disabled={loading || !partNumber.trim()}
+                        className="header-action-button export-button"
+                        style={{ backgroundColor: '#3b82f6', color: 'white', borderColor: '#3b82f6' }}
+                        title={!partNumber.trim() ? 'Enter a part number first' : `Export ${partNumber.trim()} history`}
+                    >
+                        <FileDown size={18} />
+                        Export Selected Part
                     </button>
                     <button
                         onClick={handleExportAll}

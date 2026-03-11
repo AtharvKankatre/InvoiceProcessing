@@ -44,12 +44,22 @@ TEMPLATE_COLUMNS = [
     "retail_invoice_number",
 ]
 
+OPTIONAL_COLUMNS = [
+    "plating_charges",
+    "plating_conversion_rate",
+]
+
 COLUMN_DESCRIPTIONS = [
     "Retail Part Number (e.g. RETAIL-X100)",
     "Date (YYYY-MM-DD)",
     "Quantity to dispatch",
     "Selling USD rate per unit",
     "Retail Invoice Number (must be unique)",
+]
+
+OPTIONAL_COLUMN_DESCRIPTIONS = [
+    "Chrome Plating Charges per unit (leave blank if none)",
+    "Conversion Rate at time of plating (leave blank if none)",
 ]
 
 
@@ -110,6 +120,16 @@ def _validate_row(row_num, row_data):
     if not retail_inv:
         errors.append("retail_invoice_number is required")
 
+    # Optional plating fields
+    plating_charges = _to_decimal(row_data.get("plating_charges"))
+    plating_conversion_rate = _to_decimal(row_data.get("plating_conversion_rate"))
+
+    # If one plating field is provided, the other must also be provided
+    if plating_charges and not plating_conversion_rate:
+        errors.append("plating_conversion_rate is required when plating_charges is provided")
+    if plating_conversion_rate and not plating_charges:
+        errors.append("plating_charges is required when plating_conversion_rate is provided")
+
     if errors:
         return None, f"Row {row_num}: {'; '.join(errors)}"
 
@@ -119,6 +139,8 @@ def _validate_row(row_num, row_data):
         "qty": qty,
         "usd_rate": usd_rate,
         "retail_invoice_number": retail_inv,
+        "plating_charges": plating_charges,
+        "plating_conversion_rate": plating_conversion_rate,
     }, None
 
 
@@ -271,6 +293,8 @@ def _process_single_row(row_num, cleaned, user_instance):
         conversion_rate=avg_conversion_rate,
         retail_invoice_number=retail_invoice_number,
         created_by=user_instance,
+        plating_charges=cleaned.get("plating_charges"),
+        plating_conversion_rate=cleaned.get("plating_conversion_rate"),
     )
 
     # â”€â”€ Create consumption records â”€â”€
@@ -318,7 +342,8 @@ class BulkTemplateView(APIView):
         )
 
         # Row 1: Headers
-        for col_idx, header in enumerate(TEMPLATE_COLUMNS, start=1):
+        all_columns = TEMPLATE_COLUMNS + OPTIONAL_COLUMNS
+        for col_idx, header in enumerate(all_columns, start=1):
             cell = ws.cell(row=1, column=col_idx, value=header)
             cell.font = header_font
             cell.fill = header_fill
@@ -326,13 +351,14 @@ class BulkTemplateView(APIView):
             cell.border = thin_border
 
         # Row 2: Descriptions (helper row)
-        for col_idx, desc in enumerate(COLUMN_DESCRIPTIONS, start=1):
+        all_descriptions = COLUMN_DESCRIPTIONS + OPTIONAL_COLUMN_DESCRIPTIONS
+        for col_idx, desc in enumerate(all_descriptions, start=1):
             cell = ws.cell(row=2, column=col_idx, value=desc)
             cell.font = desc_font
             cell.alignment = Alignment(horizontal='center')
 
         # Column widths
-        widths = [25, 15, 12, 15, 18, 28]
+        widths = [25, 15, 12, 15, 18, 22, 25]
         for col_idx, w in enumerate(widths, start=1):
             ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = w
 
@@ -398,15 +424,17 @@ class BulkUploadView(APIView):
         raw_headers = [str(cell.value or '').strip().lower() for cell in ws[1]]
         
         # Mapping from human readable headers to internal names
+        all_cols = TEMPLATE_COLUMNS + OPTIONAL_COLUMNS
+        all_descs = COLUMN_DESCRIPTIONS + OPTIONAL_COLUMN_DESCRIPTIONS
         HEADER_MAPPING = {
             desc.lower(): internal
-            for desc, internal in zip(COLUMN_DESCRIPTIONS, TEMPLATE_COLUMNS)
+            for desc, internal in zip(all_descs, all_cols)
         }
         
         # Translate anything that looks like a description back into the internal column name
         headers = [HEADER_MAPPING.get(h, h) for h in raw_headers]
 
-        # Validate headers
+        # Validate headers (only required columns are mandatory)
         missing_headers = [col for col in TEMPLATE_COLUMNS if col not in headers]
         if missing_headers:
             return Response(
@@ -416,6 +444,10 @@ class BulkUploadView(APIView):
             )
 
         col_indices = {col: headers.index(col) for col in TEMPLATE_COLUMNS}
+        # Add optional columns if present
+        for opt_col in OPTIONAL_COLUMNS:
+            if opt_col in headers:
+                col_indices[opt_col] = headers.index(opt_col)
 
         # Process rows (skip row 1 = headers, skip row 2 if it looks like descriptions)
         results = []
@@ -560,9 +592,11 @@ class BulkPreviewView(APIView):
 
         raw_headers = [str(cell.value or '').strip().lower() for cell in ws[1]]
         
+        all_cols = TEMPLATE_COLUMNS + OPTIONAL_COLUMNS
+        all_descs = COLUMN_DESCRIPTIONS + OPTIONAL_COLUMN_DESCRIPTIONS
         HEADER_MAPPING = {
             desc.lower(): internal
-            for desc, internal in zip(COLUMN_DESCRIPTIONS, TEMPLATE_COLUMNS)
+            for desc, internal in zip(all_descs, all_cols)
         }
         headers = [HEADER_MAPPING.get(h, h) for h in raw_headers]
 
@@ -574,6 +608,9 @@ class BulkPreviewView(APIView):
             )
 
         col_indices = {col: headers.index(col) for col in TEMPLATE_COLUMNS}
+        for opt_col in OPTIONAL_COLUMNS:
+            if opt_col in headers:
+                col_indices[opt_col] = headers.index(opt_col)
         
         rows_data = []
         total_rows = 0
@@ -606,7 +643,7 @@ class BulkPreviewView(APIView):
                 row_dict['date'] = parsed.strftime('%Y-%m-%d') if parsed else row_dict['date']
                 
             # Decimal to string mapping
-            for key in ['qty', 'usd_rate']:
+            for key in ['qty', 'usd_rate', 'plating_charges', 'plating_conversion_rate']:
                 if row_dict.get(key) is not None:
                     row_dict[key] = str(row_dict[key])
                     
@@ -892,6 +929,10 @@ class BulkCommitView(APIView):
                     retail_inr_rate = (retail_dollar_rate * avg_conversion_rate).quantize(Decimal('0.0001'), rounding=ROUND_HALF_UP)
 
                     # Save InvoiceEntry
+                    # Parse optional plating fields
+                    plating_charges = _to_decimal(row_data.get("plating_charges"))
+                    plating_conv_rate = _to_decimal(row_data.get("plating_conversion_rate"))
+
                     usd_total_final = (retail_dollar_rate * qty_to_consume).quantize(Decimal('0.01'))
                     inr_total_final = (retail_inr_rate * qty_to_consume).quantize(Decimal('0.01'))
                     invoice_entry = InvoiceEntry.objects.create(
@@ -900,6 +941,8 @@ class BulkCommitView(APIView):
                         inr_rate=retail_inr_rate, inr_total=inr_total_final,
                         conversion_rate=avg_conversion_rate, retail_invoice_number=retail_invoice_number,
                         created_by=user_instance,
+                        plating_charges=plating_charges,
+                        plating_conversion_rate=plating_conv_rate,
                     )
                     
                     # Consumptions

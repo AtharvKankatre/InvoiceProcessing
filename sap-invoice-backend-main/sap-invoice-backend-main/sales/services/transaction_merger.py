@@ -1,8 +1,9 @@
 """Transaction merger service for part-wise transaction history."""
 
-from sales.models import Invoice, InvoiceRetailPartMap
+from sales.models import Invoice, InvoiceRetailPartMap, InvoiceEntryConsumption
 from retail.models import InvoiceEntry
 from datetime import datetime
+from collections import defaultdict
 
 class TransactionMerger:
     """Service class for retrieving and merging incoming and outgoing transactions."""
@@ -79,8 +80,10 @@ class TransactionMerger:
                 'customer_code': invoice['customer_code'] or "",
                 'part_number': invoice['part_number'],
                 'fc_value': invoice['dollar_total'] or 0,
+                'rate_fc': float(invoice['dollar_rate'] or 0),
                 'inr_value': invoice['inr_total'] or 0,
                 'exchange_rate': conv_rate,
+                'invoice_id': invoice['id'],  # Track DB id for consumption grouping
             })
         
         return transactions
@@ -139,8 +142,10 @@ class TransactionMerger:
             'created_at',
             'part_number',
             'usd_total',
+            'usd_rate',
             'inr_total',
             'conversion_rate',
+            'plating_charges',
         )
 
         transactions = []
@@ -151,37 +156,174 @@ class TransactionMerger:
             # Normalize to SAP part number so grouping/filtering by SAP part works correctly
             sap_part = retail_to_sale.get(retail_pn, retail_pn)
 
+            usd_rate = float(entry['usd_rate'] or 0)
+            usd_total = float(entry['usd_total'] or 0)
+            inr_total = float(entry['inr_total'] or 0)
+            conv_rate = float(entry['conversion_rate'] or 0)
+            plating = float(entry['plating_charges'] or 0)
+            qty = entry['qty'] or 0
+
+            # Adjust for plating: subtract plating portion from FC/INR
+            adjusted_rate = usd_rate - plating
+            adjusted_fc = usd_total - (plating * qty) if plating else usd_total
+            adjusted_inr = inr_total - (plating * conv_rate * qty) if plating else inr_total
+
             transactions.append({
                 'date': entry['date'],
                 'invoice_number': entry['retail_invoice_number'] or f"OUT-{entry['date']}",
-                'qty': -entry['qty'],  # Negative for outgoing
+                'qty': -qty,  # Negative for outgoing
                 'type': 'OUTGOING',
                 'created_at': entry['created_at'],
                 'name': company,
                 'customer_code': code,
-                'part_number': sap_part,  # Use SAP part number, not retail part number
-                'fc_value': entry['usd_total'] or 0,
-                'inr_value': entry['inr_total'] or 0,
+                'part_number': sap_part,
+                'fc_value': adjusted_fc,
+                'rate_fc': adjusted_rate,
+                'inr_value': adjusted_inr,
                 'exchange_rate': entry['conversion_rate'] or 0,
+                'invoice_entry_id': entry['id'],
+                'plating_charges': plating,
             })
 
         return transactions
 
     def merge_and_sort(self, incoming, outgoing):
         """
-        Merge and sort transactions chronologically.
+        Merge incoming and outgoing transactions using invoice-wise grouping.
+        
+        Uses a two-layer matching strategy:
+        1. Bill-to-bill: Match outgoing invoices with '/A' suffix to their
+           incoming invoice by base number (e.g., 2242500426/A → 2242500426)
+        2. Split-consumption fallback: For remaining outgoing rows, use
+           InvoiceEntryConsumption to split across incoming invoices by consumed_qty
         
         Args:
             incoming: List of incoming transaction dictionaries
             outgoing: List of outgoing transaction dictionaries
             
         Returns:
-            Single merged and sorted list of transactions
+            Single merged list with outgoing rows grouped under their
+            parent incoming invoices
         """
-        # Combine both lists
-        merged = incoming + outgoing
-        
-        # Sort by exact chronological entry time instead of backdated manual 'date'
-        merged.sort(key=lambda x: x['created_at'] or datetime.min)
-        
-        return merged
+        if not incoming and not outgoing:
+            return []
+
+        # Sort incoming by date (FIFO: oldest first)
+        incoming.sort(key=lambda x: (x['date'], x['created_at'] or datetime.min))
+
+        # ── LAYER 1: Bill-to-bill matching by invoice number ──
+        # Build lookup: incoming invoice_number -> incoming transaction
+        incoming_by_invoice_num = {}
+        for txn in incoming:
+            inv_num = txn.get('invoice_number', '')
+            if inv_num:
+                incoming_by_invoice_num[inv_num] = txn
+
+        # Try to match outgoing invoices with '/A' suffix to incoming by base number
+        # e.g., outgoing "2242500426/A" → incoming "2242500426"
+        bill_to_bill_map = defaultdict(list)  # incoming_invoice_number -> [outgoing txns]
+        bill_to_bill_matched = set()  # track matched outgoing invoice_entry_ids
+
+        for txn in outgoing:
+            out_inv_num = txn.get('invoice_number', '')
+            # Check if outgoing invoice has /A suffix (bill-to-bill pattern)
+            if '/' in out_inv_num:
+                base_num = out_inv_num.split('/')[0]
+                if base_num in incoming_by_invoice_num:
+                    bill_to_bill_map[base_num].append(txn)
+                    entry_id = txn.get('invoice_entry_id')
+                    if entry_id:
+                        bill_to_bill_matched.add(entry_id)
+
+        # ── LAYER 2: Split-consumption for non-bill-to-bill outgoing ──
+        # Build lookup of remaining outgoing (not matched by bill-to-bill)
+        outgoing_by_entry_id = {}
+        for txn in outgoing:
+            entry_id = txn.get('invoice_entry_id')
+            if entry_id and entry_id not in bill_to_bill_matched:
+                outgoing_by_entry_id[entry_id] = txn
+
+        # Query InvoiceEntryConsumption for remaining outgoing
+        incoming_ids = [txn['invoice_id'] for txn in incoming if txn.get('invoice_id')]
+        outgoing_entry_ids = list(outgoing_by_entry_id.keys())
+
+        invoice_to_consumptions = defaultdict(list)
+        if incoming_ids and outgoing_entry_ids:
+            consumptions = InvoiceEntryConsumption.objects.filter(
+                invoice_id__in=incoming_ids,
+                invoice_entry_id__in=outgoing_entry_ids,
+            ).values(
+                'invoice_id', 'invoice_entry_id', 'consumed_qty', 'fc_value'
+            ).order_by('invoice_entry__date', 'invoice_entry_id')
+
+            for c in consumptions:
+                invoice_to_consumptions[c['invoice_id']].append({
+                    'entry_id': c['invoice_entry_id'],
+                    'consumed_qty': c['consumed_qty'] or 0,
+                    'fc_value': float(c['fc_value'] or 0),
+                })
+
+        # ── BUILD FINAL RESULT ──
+        result = []
+        placed_entry_ids = set(bill_to_bill_matched)  # Already placed by bill-to-bill
+
+        for inc_txn in incoming:
+            # Add incoming row
+            result.append(inc_txn)
+
+            inv_num = inc_txn.get('invoice_number', '')
+            inv_id = inc_txn.get('invoice_id')
+
+            # LAYER 1: Add bill-to-bill matched outgoing rows (full qty, no split)
+            if inv_num in bill_to_bill_map:
+                for out_txn in bill_to_bill_map[inv_num]:
+                    result.append(out_txn)
+
+            # LAYER 2: Add split-consumption outgoing rows (for non-bill-to-bill)
+            if inv_id and inv_id in invoice_to_consumptions:
+                for cons in invoice_to_consumptions[inv_id]:
+                    entry_id = cons['entry_id']
+                    consumed_qty = cons['consumed_qty']
+
+                    if entry_id not in outgoing_by_entry_id:
+                        continue
+
+                    original_txn = outgoing_by_entry_id[entry_id]
+                    original_qty = abs(original_txn['qty'])
+
+                    # Calculate proportional INR value
+                    ratio = consumed_qty / original_qty if original_qty > 0 else 0
+                    proportional_inr = float(original_txn.get('inr_value', 0)) * ratio
+
+                    # Adjust fc_value for plating
+                    raw_fc = cons['fc_value']
+                    plating = original_txn.get('plating_charges', 0)
+                    adjusted_fc = raw_fc - (plating * consumed_qty) if plating else raw_fc
+
+                    # Create split outgoing row
+                    split_txn = {
+                        'date': original_txn['date'],
+                        'invoice_number': original_txn['invoice_number'],
+                        'qty': -consumed_qty,
+                        'type': 'OUTGOING',
+                        'created_at': original_txn['created_at'],
+                        'name': original_txn.get('name', ''),
+                        'customer_code': original_txn.get('customer_code', ''),
+                        'part_number': original_txn.get('part_number', ''),
+                        'fc_value': adjusted_fc,
+                        'rate_fc': original_txn.get('rate_fc', 0),
+                        'inr_value': proportional_inr,
+                        'exchange_rate': original_txn.get('exchange_rate', 0),
+                        'invoice_entry_id': entry_id,
+                        'consumption_invoice_id': inv_id,
+                        'plating_charges': plating,
+                    }
+                    result.append(split_txn)
+                    placed_entry_ids.add(entry_id)  # Track for orphans check
+
+        # Add any remaining orphan outgoing transactions
+        orphans = [txn for txn in outgoing if txn.get('invoice_entry_id') not in placed_entry_ids]
+        orphans.sort(key=lambda x: (x['date'], x['created_at'] or datetime.min))
+        result.extend(orphans)
+
+        return result

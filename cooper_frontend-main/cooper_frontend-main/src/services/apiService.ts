@@ -119,6 +119,8 @@ export interface BulkPreviewRow {
     usd_rate: string | number;
     conversion_rate: string | number;
     retail_invoice_number: string;
+    plating_charges?: string | number;
+    plating_conversion_rate?: string | number;
   };
   errors: Record<string, string>;
   is_valid: boolean;

@@ -32,6 +32,8 @@ class InvoiceEntry(models.Model):
     rate_sale_from_wh = models.DecimalField(max_digits = 20, decimal_places = 4, null=True)
     difference = models.DecimalField(max_digits=20, decimal_places = 4, null=True)
     surcharge = models.DecimalField(max_digits=20, decimal_places = 4, null=True)
+    plating_charges = models.DecimalField(max_digits=20, decimal_places=4, null=True, blank=True)
+    plating_conversion_rate = models.DecimalField(max_digits=20, decimal_places=4, null=True, blank=True)
     def __str__(self):
         return f"Invoice {self.invoice_number} - {self.part_number}"
 

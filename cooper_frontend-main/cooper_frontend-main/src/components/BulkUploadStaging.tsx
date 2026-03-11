@@ -415,6 +415,8 @@ const BulkUploadStaging: React.FC<BulkUploadStagingProps> = ({ file, onClose, on
                             <th>Quantity</th>
                             <th>$ Rate</th>
                             <th>Retail Inv Number</th>
+                            <th>Plating Charges</th>
+                            <th>Plating Conv Rate</th>
                             <th>Actions</th>
                         </tr>
                     </thead>
@@ -488,6 +490,22 @@ const BulkUploadStaging: React.FC<BulkUploadStagingProps> = ({ file, onClose, on
                                             title={row.errors.retail_invoice_number}
                                         />
                                         {row.errors.retail_invoice_number && <div className="cell-error-msg">{row.errors.retail_invoice_number}</div>}
+                                    </td>
+                                    <td>
+                                        <Input
+                                            type="number" step="0.01"
+                                            value={row.data.plating_charges || ''}
+                                            onChange={(e) => handleCellChange(row.row_id, 'plating_charges', e.target.value)}
+                                            placeholder="—"
+                                        />
+                                    </td>
+                                    <td>
+                                        <Input
+                                            type="number" step="0.01"
+                                            value={row.data.plating_conversion_rate || ''}
+                                            onChange={(e) => handleCellChange(row.row_id, 'plating_conversion_rate', e.target.value)}
+                                            placeholder="—"
+                                        />
                                     </td>
                                     <td>
                                         <div className="action-buttons-cell">
