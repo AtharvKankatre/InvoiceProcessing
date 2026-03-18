@@ -141,6 +141,9 @@ class PartWiseTracking(models.Model):
     ccpl_to_wh_qty = models.DecimalField(max_digits=20, decimal_places=4, null=True, blank=True)
     ccpl_to_wh_fc = models.DecimalField(max_digits=20, decimal_places=4, null=True, blank=True)
     ccpl_to_wh_inr = models.DecimalField(max_digits=20, decimal_places=4, null=True, blank=True)
+    
+    # Original Invoice Quantity (for Power BI)
+    invoice_qty = models.DecimalField(max_digits=20, decimal_places=4, null=True, blank=True)
 
     # WH to Customer (Outgoing)
     wh_to_customer_qty = models.DecimalField(max_digits=20, decimal_places=4, null=True, blank=True)

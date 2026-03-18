@@ -7,6 +7,7 @@ Provides:
 """
 
 import io
+import re
 from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_UP
 
@@ -41,6 +42,7 @@ TEMPLATE_COLUMNS = [
     "date",
     "qty",
     "usd_rate",
+    "conversion_rate",
     "retail_invoice_number",
 ]
 
@@ -54,6 +56,7 @@ COLUMN_DESCRIPTIONS = [
     "Date (YYYY-MM-DD)",
     "Quantity to dispatch",
     "Selling USD rate per unit",
+    "Conversion Rate (retail dispatch rate)",
     "Retail Invoice Number (must be unique)",
 ]
 
@@ -84,7 +87,15 @@ def _parse_date(value):
     if isinstance(value, date):
         return value
     date_str = str(value).strip()
-    for fmt in ('%Y-%m-%d', '%d-%m-%Y', '%d/%m/%Y', '%m/%d/%Y'):
+    
+    # Handle the case where Excel passes the date as a raw integer string (e.g. '45362' for 2024-03-11)
+    if date_str.isdigit():
+        try:
+            return datetime.fromordinal(datetime(1899, 12, 30).toordinal() + int(date_str)).date()
+        except ValueError:
+            pass
+
+    for fmt in ('%Y-%m-%d', '%d-%m-%Y', '%d/%m/%Y', '%m/%d/%Y', '%d.%m.%Y', '%Y.%m.%d'):
         try:
             return datetime.strptime(date_str, fmt).date()
         except ValueError:
@@ -116,6 +127,9 @@ def _validate_row(row_num, row_data):
     if usd_rate is None:
         errors.append("usd_rate is required and must be a number")
 
+    # Conversion rate from the retail dispatch (optional — falls back to Cooper ER if not provided)
+    conversion_rate = _to_decimal(row_data.get("conversion_rate"))
+
     retail_inv = str(row_data.get("retail_invoice_number") or "").strip()
     if not retail_inv:
         errors.append("retail_invoice_number is required")
@@ -138,13 +152,14 @@ def _validate_row(row_num, row_data):
         "date": row_date,
         "qty": qty,
         "usd_rate": usd_rate,
+        "conversion_rate": conversion_rate,
         "retail_invoice_number": retail_inv,
         "plating_charges": plating_charges,
         "plating_conversion_rate": plating_conversion_rate,
     }, None
 
 
-def _process_single_row(row_num, cleaned, user_instance):
+def _process_single_row(row_num, cleaned, user_instance, reserved_invoice_ids=set()):
     """
     Process one validated row.
     - Positive qty: FIFO consumption (dispatch stock from oldest invoices)
@@ -176,11 +191,35 @@ def _process_single_row(row_num, cleaned, user_instance):
     consumed_records = []
 
     if qty_to_consume > 0:
-        # POSITIVE QTY: Normal FIFO consumption (dispatch)
-        matching_invoices = Invoice.objects.filter(
+        # POSITIVE QTY: Bill-to-Bill priority, fallback to FIFO (dispatch)
+        # Aggressively strip .A, /A, -A or any trailing letter from outgoing invoice number
+        clean_retail = re.sub(r'[/.\-]\s*[A-Za-z]\d*$', '', retail_invoice_number).strip()
+        
+        available_qs = Invoice.objects.filter(
             part_number=sale_part_number,
             qty__gt=0,
         ).order_by("date", "id")
+
+        matching_invoices = []
+        other_invoices = []
+        
+        # Priority 1: Exact invoice match (by cleaning both sides)
+        for inv in available_qs:
+            clean_incoming = re.sub(r'[/.\-]\s*[A-Za-z]\d*$', '', inv.invoice_number).strip()
+            if clean_incoming == clean_retail:
+                matching_invoices.append(inv)
+                # If we've found our specific match, we no longer need to restrict it from ourselves
+                if inv.id in reserved_invoice_ids:
+                    reserved_invoice_ids.remove(inv.id)
+            else:
+                other_invoices.append(inv)
+
+        # Priority 2: FIFO fallback if exact matches aren't enough (or don't exist)
+        current_matched_qty = sum(inv.qty for inv in matching_invoices)
+        if current_matched_qty < qty_to_consume:
+            # ONLY use other invoices that are NOT reserved for someone else's Bill-to-Bill match
+            unreserved_others = [inv for inv in other_invoices if inv.id not in reserved_invoice_ids]
+            matching_invoices.extend(unreserved_others)
 
         total_available = sum(inv.qty for inv in matching_invoices)
         if total_available < qty_to_consume:
@@ -276,7 +315,10 @@ def _process_single_row(row_num, cleaned, user_instance):
     else:
         avg_conversion_rate = Decimal('0')
 
-    retail_inr_rate = (retail_dollar_rate * avg_conversion_rate).quantize(Decimal('0.0001'), rounding=ROUND_HALF_UP)
+    # Use uploaded conversion_rate if provided, otherwise fall back to Cooper ER average
+    final_conversion_rate = cleaned.get("conversion_rate") or avg_conversion_rate
+
+    retail_inr_rate = (retail_dollar_rate * final_conversion_rate).quantize(Decimal('0.0001'), rounding=ROUND_HALF_UP)
 
     # â”€â”€ Create InvoiceEntry â”€â”€
     usd_total_final = (retail_dollar_rate * qty_to_consume).quantize(Decimal('0.01'))
@@ -290,7 +332,7 @@ def _process_single_row(row_num, cleaned, user_instance):
         usd_total=usd_total_final,
         inr_rate=retail_inr_rate,
         inr_total=inr_total_final,
-        conversion_rate=avg_conversion_rate,
+        conversion_rate=final_conversion_rate,
         retail_invoice_number=retail_invoice_number,
         created_by=user_instance,
         plating_charges=cleaned.get("plating_charges"),
@@ -449,14 +491,46 @@ class BulkUploadView(APIView):
             if opt_col in headers:
                 col_indices[opt_col] = headers.index(opt_col)
 
-        # Process rows (skip row 1 = headers, skip row 2 if it looks like descriptions)
+        # --- NEW: Two-Pass System to protect Bill-to-Bill matches from FIFO ---
+        # Pass 1: Pre-scan all rows for exact Bill-to-Bill matches and reserve those incoming invoices
+        reserved_invoice_ids = set()
+        
+        # Read all rows into memory for pre-scan (so we can iterate twice)
+        raw_rows = list(ws.iter_rows(min_row=2, values_only=True))
+        
+        for row in raw_rows:
+            if not row or all(cell is None or str(cell).strip() == '' for cell in row):
+                continue
+            first_val = str(row[0] or "").strip().lower() if row else ""
+            if "retail part" in first_val or "example" in first_val or "description" in first_val or "e.g." in first_val:
+                continue
+                
+            # Extract basic info
+            row_data = {}
+            for col_name, col_idx in col_indices.items():
+                row_data[col_name] = row[col_idx] if col_idx < len(row) else None
+                
+            # If valid, look for its Bill-to-Bill match and reserve it
+            cleaned, error = _validate_row(0, row_data)
+            if not error and cleaned['qty'] > 0:
+                part_mapping = InvoiceRetailPartMap.objects.filter(retail_part_number=cleaned['part_number']).first()
+                sale_part = part_mapping.sale_part_number if part_mapping else cleaned['part_number']
+                clean_retail_inv = re.sub(r'[/.\-]\s*[A-Za-z]\d*$', '', cleaned['retail_invoice_number']).strip()
+                
+                matches = Invoice.objects.filter(part_number=sale_part, qty__gt=0)
+                for inv in matches:
+                    clean_inc = re.sub(r'[/.\-]\s*[A-Za-z]\d*$', '', inv.invoice_number).strip()
+                    if clean_inc == clean_retail_inv:
+                        reserved_invoice_ids.add(inv.id)
+
+        # Pass 2: Process rows with reservations in place
         results = []
         successful = 0
         failed = 0
         total_rows = 0
         seen_invoice_numbers = {}  # Track invoice numbers within THIS upload file
 
-        for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+        for row_idx, row in enumerate(raw_rows, start=2):
             # Skip completely empty rows
             if not row or all(cell is None or str(cell).strip() == '' for cell in row):
                 continue
@@ -515,7 +589,7 @@ class BulkUploadView(APIView):
             # Process within its own atomic transaction
             try:
                 with transaction.atomic():
-                    success, message = _process_single_row(row_num, cleaned, user_instance)
+                    success, message = _process_single_row(row_num, cleaned, user_instance, reserved_invoice_ids)
 
                 if success:
                     successful += 1
@@ -643,7 +717,7 @@ class BulkPreviewView(APIView):
                 row_dict['date'] = parsed.strftime('%Y-%m-%d') if parsed else row_dict['date']
                 
             # Decimal to string mapping
-            for key in ['qty', 'usd_rate', 'plating_charges', 'plating_conversion_rate']:
+            for key in ['qty', 'usd_rate', 'conversion_rate', 'plating_charges', 'plating_conversion_rate']:
                 if row_dict.get(key) is not None:
                     row_dict[key] = str(row_dict[key])
                     
@@ -679,6 +753,21 @@ class BulkPreviewView(APIView):
                     } for inv in invoices
                 ]
             }
+
+        # --- Pass 1.5: Identify exact matches to reserve them from FIFO ---
+        reserved_invoice_ids = set()
+        for item in rows_data:
+            clean_row, error = _validate_row(item["row"], item["data"])
+            if not error and clean_row['qty'] > 0:
+                part = clean_row['part_number']
+                mapping = InvoiceRetailPartMap.objects.filter(retail_part_number=part).first()
+                sale_part = mapping.sale_part_number if mapping else part
+                clean_retail = re.sub(r'[/.\-]\s*[A-Za-z]\d*$', '', clean_row['retail_invoice_number']).strip()
+                
+                for inv in part_inventory.get(part, {}).get("invoices", []):
+                    clean_inc = re.sub(r'[/.\-]\s*[A-Za-z]\d*$', '', inv["invoice_number"]).strip()
+                    if clean_inc == clean_retail:
+                        reserved_invoice_ids.add(inv["id"])
 
         # Step 3: Decorate rows with errors / readiness
         results = []
@@ -783,6 +872,27 @@ class BulkCommitView(APIView):
                     except (ValueError, TypeError):
                         return Response({"error": f"Row {item.get('row_id', idx)}: invoice_id must be integer and qty must be number."}, status=status.HTTP_400_BAD_REQUEST)
             
+        # --- NEW: Two-Pass System to protect Bill-to-Bill matches from FIFO ---
+        reserved_invoice_ids = set()
+        
+        for item in rows:
+            row_data = item.get("data", {})
+            row_id = item.get("row_id", 0)
+            cleaned, error = _validate_row(row_id, row_data)
+            
+            if not error and cleaned['qty'] > 0:
+                # Auto-detect Bill-to-Bill match and reserve
+                part = cleaned['part_number']
+                mapping = InvoiceRetailPartMap.objects.filter(retail_part_number=part).first()
+                sale_part = mapping.sale_part_number if mapping else part
+                clean_retail = re.sub(r'[/.\-]\s*[A-Za-z]\d*$', '', cleaned['retail_invoice_number']).strip()
+                
+                matches = Invoice.objects.filter(part_number=sale_part, qty__gt=0)
+                for inv in matches:
+                    clean_inc = re.sub(r'[/.\-]\s*[A-Za-z]\d*$', '', inv.invoice_number).strip()
+                    if clean_inc == clean_retail:
+                        reserved_invoice_ids.add(inv.id)
+
         successful = 0
         failed = 0
         results = []
@@ -815,46 +925,45 @@ class BulkCommitView(APIView):
                     consumed_records = []
                     
                     if qty_to_consume > 0:
-                        # POSITIVE QTY: Dispatch (Custom selection or FIFO)
-                        if selected_invoices and isinstance(selected_invoices, list) and len(selected_invoices) > 0:
-                            total_selected_qty = Decimal('0')
-                            for selection in selected_invoices:
-                                inv_id = selection.get("invoice_id")
-                                sel_qty = Decimal(str(selection.get("qty", 0)))
-                                if not inv_id or sel_qty <= 0:
-                                    continue
-                                try:
-                                    invoice = Invoice.objects.get(id=inv_id, part_number=sale_part_number, qty__gt=0)
-                                except Invoice.DoesNotExist:
-                                    raise Exception(f"Row {row_id}: Invoice ID {inv_id} not found or empty.")
-                                    
-                                if sel_qty > invoice.qty:
-                                    raise Exception(f"Row {row_id}: Invoice {invoice.invoice_number} has only {invoice.qty} available.")
-                                    
-                                invoice.qty -= int(sel_qty)
-                                invoice.created_by = user_instance
-                                invoice.save()
-                                consumed_records.append((invoice, sel_qty))
-                                total_selected_qty += sel_qty
+                        # POSITIVE QTY: Always use Bill-to-Bill + reserved FIFO
+                        # (ignore frontend selected_invoices — server knows better)
+                        available_qs = Invoice.objects.filter(part_number=sale_part_number, qty__gt=0).order_by("date", "id")
+                        
+                        matching_invoices = []
+                        other_invoices = []
+                        
+                        clean_retail = re.sub(r'[/.\-]\s*[A-Za-z]\d*$', '', retail_invoice_number).strip()
+                        
+                        # Priority 1: Exact Bill-to-Bill matches
+                        for inv in available_qs:
+                            clean_incoming = re.sub(r'[/.\-]\s*[A-Za-z]\d*$', '', inv.invoice_number).strip()
+                            if clean_incoming == clean_retail:
+                                matching_invoices.append(inv)
+                                # Un-reserve since we're consuming it now
+                                if inv.id in reserved_invoice_ids:
+                                    reserved_invoice_ids.discard(inv.id)
+                            else:
+                                other_invoices.append(inv)
                                 
-                            if total_selected_qty != qty_to_consume:
-                                raise Exception(f"Row {row_id}: Selected quantity ({total_selected_qty}) != Requested quantity ({qty_to_consume}).")
-                        else:
-                            # FIFO
-                            matching_invoices = Invoice.objects.filter(part_number=sale_part_number, qty__gt=0).order_by("date", "id")
-                            total_available = sum(inv.qty for inv in matching_invoices)
-                            if total_available < qty_to_consume:
-                                raise Exception(f"Row {row_id}: Not enough stock. Requested {qty_to_consume}, Available {total_available}.")
-                                
-                            qty_remaining = qty_to_consume
-                            for invoice in matching_invoices:
-                                if qty_remaining == 0: break
-                                consumed_qty = min(qty_remaining, Decimal(invoice.qty))
-                                qty_remaining -= consumed_qty
-                                invoice.qty -= int(consumed_qty)
-                                invoice.created_by = user_instance
-                                invoice.save()
-                                consumed_records.append((invoice, consumed_qty))
+                        # Priority 2: FIFO fallback (only unreserved invoices)
+                        current_matched_qty = sum(inv.qty for inv in matching_invoices)
+                        if current_matched_qty < qty_to_consume:
+                            unreserved_others = [inv for inv in other_invoices if inv.id not in reserved_invoice_ids]
+                            matching_invoices.extend(unreserved_others)
+                            
+                        total_available = sum(inv.qty for inv in matching_invoices)
+                        if total_available < qty_to_consume:
+                            raise Exception(f"Row {row_id}: Not enough stock. Requested {qty_to_consume}, Available {total_available}.")
+                            
+                        qty_remaining = qty_to_consume
+                        for invoice in matching_invoices:
+                            if qty_remaining == 0: break
+                            consumed_qty = min(qty_remaining, Decimal(invoice.qty))
+                            qty_remaining -= consumed_qty
+                            invoice.qty -= int(consumed_qty)
+                            invoice.created_by = user_instance
+                            invoice.save()
+                            consumed_records.append((invoice, consumed_qty))
                     else:
                         # NEGATIVE QTY: Credit note / return (LIFO)
                         abs_qty = abs(qty_to_consume)
@@ -920,13 +1029,17 @@ class BulkCommitView(APIView):
                         total_qty += abs(consumed_qty)
                         weighted_conv_sum += inv_conversion_rate * abs(consumed_qty)
                         
-                    # Calculate weighted average conversion rate
+                    # Calculate weighted average conversion rate (fallback)
                     if total_qty:
                         avg_conversion_rate = (weighted_conv_sum / total_qty).quantize(Decimal('0.0001'), rounding=ROUND_HALF_UP)
                     else:
                         avg_conversion_rate = Decimal('0')
 
-                    retail_inr_rate = (retail_dollar_rate * avg_conversion_rate).quantize(Decimal('0.0001'), rounding=ROUND_HALF_UP)
+                    # Use uploaded conversion_rate if provided, otherwise fall back to Cooper ER average
+                    uploaded_conv_rate = _to_decimal(row_data.get("conversion_rate"))
+                    final_conversion_rate = uploaded_conv_rate or avg_conversion_rate
+
+                    retail_inr_rate = (retail_dollar_rate * final_conversion_rate).quantize(Decimal('0.0001'), rounding=ROUND_HALF_UP)
 
                     # Save InvoiceEntry
                     # Parse optional plating fields
@@ -939,7 +1052,7 @@ class BulkCommitView(APIView):
                         part_number=part_number, date=entry_date, qty=int(qty_to_consume),
                         usd_rate=retail_dollar_rate, usd_total=usd_total_final,
                         inr_rate=retail_inr_rate, inr_total=inr_total_final,
-                        conversion_rate=avg_conversion_rate, retail_invoice_number=retail_invoice_number,
+                        conversion_rate=final_conversion_rate, retail_invoice_number=retail_invoice_number,
                         created_by=user_instance,
                         plating_charges=plating_charges,
                         plating_conversion_rate=plating_conv_rate,

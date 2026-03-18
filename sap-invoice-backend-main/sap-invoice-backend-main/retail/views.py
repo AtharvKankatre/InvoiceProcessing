@@ -564,6 +564,7 @@ class InvoiceEntryCreateView(generics.CreateAPIView):
                 
             else:
                 # AUTO-FIFO MODE: Original behavior - automatically select invoices
+                import re
                 if invoice_number:
                     matching_invoices = Invoice.objects.filter(
                         part_number=sale_part_number,
@@ -571,10 +572,22 @@ class InvoiceEntryCreateView(generics.CreateAPIView):
                         qty__gt=0,
                     ).order_by("date", "id")
                 else:
-                    matching_invoices = Invoice.objects.filter(
-                        part_number=sale_part_number,
-                        qty__gt=0,
-                    ).order_by("date", "id")
+                    clean_retail = re.sub(r'[/.\-]\s*[A-Za-z]\d*$', '', retail_invoice_number).strip() if retail_invoice_number else ""
+                    available_qs = Invoice.objects.filter(part_number=sale_part_number, qty__gt=0).order_by("date", "id")
+                    
+                    matching_invoices = []
+                    other_invoices = []
+                    
+                    for inv in available_qs:
+                        clean_incoming = re.sub(r'[/.\-]\s*[A-Za-z]\d*$', '', inv.invoice_number).strip()
+                        if clean_incoming and clean_incoming == clean_retail:
+                            matching_invoices.append(inv)
+                        else:
+                            other_invoices.append(inv)
+                    
+                    current_matched_qty = sum(inv.qty for inv in matching_invoices)
+                    if current_matched_qty < qty_to_consume:
+                        matching_invoices.extend(other_invoices)
 
                 total_available_qty = sum(invoice.qty for invoice in matching_invoices)
                 if total_available_qty < qty_to_consume:

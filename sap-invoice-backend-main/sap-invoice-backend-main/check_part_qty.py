@@ -1,62 +1,57 @@
-"""
-Django shell script to investigate WH to Customer Qty for part CKJMCFG0070030A.
-Run with: python manage.py shell -c "exec(open('check_part_qty.py').read())"
-"""
-from sales.models import InvoiceRetailPartMap, InvoiceEntryConsumption
-from retail.models import InvoiceEntry
-from decimal import Decimal
+import os, django
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'InvoiceProcessing.settings')
+django.setup()
 
-TARGET_PART = 'CKJMCFG0070030A'
+from sales.services.stock_ledger import StockLedgerService
 
-# 1. Find all retail part numbers mapped to this sale part
-maps = InvoiceRetailPartMap.objects.filter(sale_part_number=TARGET_PART)
-print(f"\n=== Retail Part Mappings for {TARGET_PART} ===")
-retail_parts = []
-for m in maps:
-    print(f"  Retail: {m.retail_part_number} | Company: {m.company_name}")
-    retail_parts.append(m.retail_part_number)
-
-# 2. Get all InvoiceEntry records with these retail parts
-entries = InvoiceEntry.objects.filter(part_number__in=retail_parts).prefetch_related('consumptions')
-
-print(f"\n=== Total InvoiceEntry records found: {entries.count()} ===")
-
-# 3. Calculate totals both ways
-raw_qty_total = 0       # Sum of entry.qty  (what client might be using)
-hybrid_qty_total = 0    # What our system calculates (consumption-based)
-
-entries_with_consumption = 0
-entries_without_consumption = 0
-
-for entry in entries:
-    raw_qty = entry.qty or 0
-    raw_qty_total += raw_qty
+def check_discrepancies():
+    print("Generating Stock Ledger (Sheet 1)...")
+    ledger_data = StockLedgerService.get_ledger_data('01-04-2025', '11-03-2026')
     
-    cons = entry.consumptions.all()
-    if cons.exists():
-        entries_with_consumption += 1
-        for c in cons:
-            hybrid_qty_total += c.consumed_qty or 0
-    else:
-        entries_without_consumption += 1
-        hybrid_qty_total += raw_qty
+    s1_totals = {}
+    for row in ledger_data:
+        party = row.get("Party Name", "Unknown")
+        s1_totals[party] = {
+            'qty': int(row.get("Closing Stock Qty", 0) or 0),
+            'fc': round(float(row.get("Closing Stock FC Value", 0) or 0), 2),
+            'inr': round(float(row.get("Closing Stock INR Value", 0) or 0), 2)
+        }
+        
+    print("Generating Part-Wise Tracking (Sheet 3)...")
+    partwise_data = StockLedgerService.get_partwise_consumption_data('01-04-2025', '11-03-2026')
+    
+    s3_totals = {}
+    for row in partwise_data:
+        if row.get('_row_type') == 'customer_subtotal':
+            party_raw = row.get("Party Name", "")
+            party = party_raw.replace(" — Despatch Total", "")
+            
+            if party not in s3_totals:
+                s3_totals[party] = {'qty': 0, 'fc': 0.0, 'inr': 0.0}
+            
+            s3_totals[party]['qty'] += int(row.get("Closing Qty", 0) or 0)
+            s3_totals[party]['fc'] += round(float(row.get("Closing FC", 0) or 0), 2)
+            s3_totals[party]['inr'] += round(float(row.get("Closing INR", 0) or 0), 2)
 
-print(f"\n=== QUANTITY COMPARISON ===")
-print(f"  Raw entry.qty total:              {raw_qty_total}")
-print(f"  Hybrid qty (consumption-based):   {hybrid_qty_total}")
-print(f"  Difference:                       {raw_qty_total - hybrid_qty_total}")
-print(f"\n  Entries WITH consumption records: {entries_with_consumption}")
-print(f"  Entries WITHOUT consumption:      {entries_without_consumption}")
+    print("\n=== COMPARING SH1 vs SH3 ===")
+    all_parties = set(list(s1_totals.keys()) + list(s3_totals.keys()))
+    
+    mismatch_found = False
+    for p in sorted(all_parties):
+        # Ignore empty party
+        if not p.strip() or p == 'Unknown':
+            continue
+            
+        s1 = s1_totals.get(p, {'qty': 0, 'fc': 0, 'inr': 0})
+        s3 = s3_totals.get(p, {'qty': 0, 'fc': 0, 'inr': 0})
+        
+        if s1['qty'] != s3['qty'] or abs(s1['fc'] - s3['fc']) > 1 or abs(s1['inr'] - s3['inr']) > 1:
+            print(f"MISMATCH FOR: {p}")
+            print(f"  SH1 (Stock Ledger): QTY={s1['qty']}, FC={s1['fc']}, INR={s1['inr']}")
+            print(f"  SH3 (Part-Wise):    QTY={s3['qty']}, FC={s3['fc']}, INR={s3['inr']}")
+            mismatch_found = True
+            
+    if not mismatch_found:
+        print("PERFECT MATCH FOR ALL CUSTOMERS!")
 
-# 4. Detailed breakdown
-print(f"\n=== DETAILED ENTRY BREAKDOWN ===")
-for entry in entries.order_by('date'):
-    cons = entry.consumptions.all()
-    cons_qty = sum(c.consumed_qty or 0 for c in cons) if cons.exists() else None
-    print(f"  Date: {entry.date} | Part: {entry.part_number} | entry.qty: {entry.qty} | consumed_qty: {cons_qty} | id: {entry.id}")
-
-# 5. Check direct entries
-direct_entries = InvoiceEntry.objects.filter(part_number=TARGET_PART)
-print(f"\n=== Direct InvoiceEntry with part_number={TARGET_PART}: {direct_entries.count()} ===")
-for e in direct_entries:
-    print(f"  Date: {e.date} | qty: {e.qty}")
+check_discrepancies()

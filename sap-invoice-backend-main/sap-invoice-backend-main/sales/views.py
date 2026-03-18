@@ -170,19 +170,37 @@ def upload_invoice_excel(request):
             #     date__lte=date(fiscal_year_end, 3, 31),
             # ).exists()
 
+            # Jaguar Land Rover only has INR values — the Excel puts them
+            # in the $ columns, so we swap them into the INR columns.
+            customer_name_raw = str(row.get("customer name", "")).strip()
+            is_jaguar = 'jaguar' in customer_name_raw.lower()
+
+            if is_jaguar:
+                upload_dollar_rate = 0
+                upload_dollar_total = 0
+                upload_inr_rate = row["inr rate"]
+                upload_inr_total = row["inr total"]
+                upload_conversion_rate = 1
+            else:
+                upload_dollar_rate = row["$ rate"]
+                upload_dollar_total = row["$ total"]
+                upload_inr_rate = row["inr rate"]
+                upload_inr_total = row["inr total"]
+                upload_conversion_rate = row["conversion rate"]
+
             invoice = Invoice.objects.create(
                 invoice_number=row["invoice number"],
                 part_number=row["part number"],
                 date=pd.to_datetime(row["date"], dayfirst=True).date(),  # "08.03.2022"
                 qty=int(row["qty"]),
                 invoice_qty = int(row["qty"]),
-                dollar_rate=row["$ rate"],
-                dollar_total=row["$ total"],
-                inr_rate=row["inr rate"],
-                inr_total=row["inr total"],
-                conversion_rate=row["conversion rate"],
+                dollar_rate=upload_dollar_rate,
+                dollar_total=upload_dollar_total,
+                inr_rate=upload_inr_rate,
+                inr_total=upload_inr_total,
+                conversion_rate=upload_conversion_rate,
                 customer_code=row["customer code"],
-                customer_name = row["customer name"],
+                customer_name = customer_name_raw,
                 created_by=user_instance,
             )
             created_invoice_records.append(invoice)
@@ -598,11 +616,34 @@ class PartHistoryViewSet(viewsets.ViewSet):
             merged_transactions = merger.merge_and_sort(
                 incoming_transactions, outgoing_transactions
             )
-            
+            # Define opening_date parsing safely
+            if from_date:
+                opening_date = datetime.strptime(from_date, "%Y-%m-%d").date() if isinstance(from_date, str) else from_date
+            else:
+                opening_date = None
+
             # Calculate running balance (Only if SINGLE part is selected)
             # For ALL parts, running balance across mixed part numbers is meaningless
             # So we only calculate it if a specific part is selected.
             if fetch_part:
+                if opening_date:
+                    op_qty, op_inr, op_fc = merger.get_opening_balance(fetch_part, opening_date)
+                    opening_txn = {
+                        'date': opening_date.strftime("%Y-%m-%d"),
+                        'invoice_number': 'Opening Balance',
+                        'qty': op_qty,
+                        'type': 'OPENING',
+                        'created_at': datetime.min,
+                        'name': '',
+                        'customer_code': '',
+                        'part_number': fetch_part,
+                        'fc_value': op_fc,
+                        'rate_fc': 0,
+                        'inr_value': op_inr,
+                        'exchange_rate': 0,
+                    }
+                    merged_transactions.insert(0, opening_txn)
+
                 transactions_with_balance = calculator.calculate_running_balance(
                     merged_transactions
                 )
@@ -616,6 +657,24 @@ class PartHistoryViewSet(viewsets.ViewSet):
                  
                  transactions_with_balance = []
                  for p_num, p_txns in grouped_txns.items():
+                     if opening_date:
+                         op_qty, op_inr, op_fc = merger.get_opening_balance(p_num, opening_date)
+                         opening_txn = {
+                             'date': opening_date.strftime("%Y-%m-%d"),
+                             'invoice_number': 'Opening Balance',
+                             'qty': op_qty,
+                             'type': 'OPENING',
+                             'created_at': datetime.min,
+                             'name': '',
+                             'customer_code': '',
+                             'part_number': p_num,
+                             'fc_value': op_fc,
+                             'rate_fc': 0,
+                             'inr_value': op_inr,
+                             'exchange_rate': 0,
+                         }
+                         p_txns.insert(0, opening_txn)
+
                      p_bals = calculator.calculate_running_balance(p_txns)
                      transactions_with_balance.extend(p_bals)
                  # Final sort by Part Number only — preserve invoice-wise grouping within each part
@@ -651,7 +710,7 @@ class PartHistoryViewSet(viewsets.ViewSet):
                 entry_id = txn.get('invoice_entry_id')
                 consumed_qty = abs(txn.get('qty', 0))
                 if not entry_id or not consumed_qty:
-                    return 0, 0
+                    return Decimal(0), Decimal(0)
 
                 # Try to find the SPECIFIC consumption record for this split row
                 consumption_invoice_id = txn.get('consumption_invoice_id')
@@ -661,19 +720,20 @@ class PartHistoryViewSet(viewsets.ViewSet):
                     c = consumption_by_key.get((entry_id, consumption_invoice_id))
                     if c:
                         inv = c.invoice
+                            
                         entry = c.invoice_entry
                         c_qty = consumed_qty
 
-                        inv_dollar_rate = inv.dollar_rate or Decimal(0)
-                        entry_usd_rate = entry.usd_rate or Decimal(0)
-                        plating = entry.plating_charges or Decimal(0)
+                        inv_dollar_rate = round(inv.dollar_rate or Decimal(0), 2)
+                        entry_usd_rate = round(entry.usd_rate or Decimal(0), 2)
+                        plating = round(entry.plating_charges or Decimal(0), 2)
                         adjusted_rate = entry_usd_rate - plating
-                        inv_er = inv.conversion_rate or Decimal(0)
-                        entry_er = entry.conversion_rate or Decimal(0)
+                        inv_er = round(inv.conversion_rate or Decimal(0), 2)
+                        entry_er = round(entry.conversion_rate or Decimal(0), 2)
 
                         s_fc = (inv_dollar_rate - adjusted_rate) * c_qty
-                        surcharge = float(round(s_fc * inv_er, 2))
-                        exchange_gain = float(round((inv_er - entry_er) * c_qty * adjusted_rate, 2))
+                        surcharge = Decimal(str(round(s_fc * inv_er, 2)))
+                        exchange_gain = Decimal(str(round((inv_er - entry_er) * c_qty * adjusted_rate, 2)))
 
                         return surcharge, exchange_gain
 
@@ -681,24 +741,25 @@ class PartHistoryViewSet(viewsets.ViewSet):
                 # Use all consumption records for this entry
                 cons_list = consumption_by_entry.get(entry_id, [])
                 if not cons_list:
-                    return 0, 0
+                    return Decimal(0), Decimal(0)
 
                 # If only one consumption record, use it directly
                 if len(cons_list) == 1:
                     c = cons_list[0]
                     inv = c.invoice
+                        
                     entry = c.invoice_entry
 
-                    inv_dollar_rate = inv.dollar_rate or Decimal(0)
-                    entry_usd_rate = entry.usd_rate or Decimal(0)
-                    plating = entry.plating_charges or Decimal(0)
+                    inv_dollar_rate = round(inv.dollar_rate or Decimal(0), 2)
+                    entry_usd_rate = round(entry.usd_rate or Decimal(0), 2)
+                    plating = round(entry.plating_charges or Decimal(0), 2)
                     adjusted_rate = entry_usd_rate - plating
-                    inv_er = inv.conversion_rate or Decimal(0)
-                    entry_er = entry.conversion_rate or Decimal(0)
+                    inv_er = round(inv.conversion_rate or Decimal(0), 2)
+                    entry_er = round(entry.conversion_rate or Decimal(0), 2)
 
                     s_fc = (inv_dollar_rate - adjusted_rate) * consumed_qty
-                    surcharge = float(round(s_fc * inv_er, 2))
-                    exchange_gain = float(round((inv_er - entry_er) * consumed_qty * adjusted_rate, 2))
+                    surcharge = Decimal(str(round(s_fc * inv_er, 2)))
+                    exchange_gain = Decimal(str(round((inv_er - entry_er) * consumed_qty * adjusted_rate, 2)))
                     return surcharge, exchange_gain
 
                 # Multiple consumptions without specific match: sum all
@@ -706,21 +767,25 @@ class PartHistoryViewSet(viewsets.ViewSet):
                 total_exchange_gain = Decimal(0)
                 for c in cons_list:
                     inv = c.invoice
+                        
                     entry = c.invoice_entry
                     c_qty = c.consumed_qty or 0
 
-                    inv_dollar_rate = inv.dollar_rate or Decimal(0)
-                    entry_usd_rate = entry.usd_rate or Decimal(0)
-                    plating = entry.plating_charges or Decimal(0)
+                    inv_dollar_rate = round(inv.dollar_rate or Decimal(0), 2)
+                    entry_usd_rate = round(entry.usd_rate or Decimal(0), 2)
+                    plating = round(entry.plating_charges or Decimal(0), 2)
                     adjusted_rate = entry_usd_rate - plating
-                    inv_er = inv.conversion_rate or Decimal(0)
-                    entry_er = entry.conversion_rate or Decimal(0)
+                    inv_er = round(inv.conversion_rate or Decimal(0), 2)
+                    entry_er = round(entry.conversion_rate or Decimal(0), 2)
 
                     s_fc = (inv_dollar_rate - adjusted_rate) * c_qty
-                    total_surcharge += s_fc * inv_er
-                    total_exchange_gain += (inv_er - entry_er) * c_qty * adjusted_rate
+                    s_inr = Decimal(str(round(s_fc * inv_er, 2)))
+                    ex_gain = Decimal(str(round((inv_er - entry_er) * c_qty * adjusted_rate, 2)))
 
-                return float(round(total_surcharge, 2)), float(round(total_exchange_gain, 2))
+                    total_surcharge += s_inr
+                    total_exchange_gain += ex_gain
+
+                return total_surcharge, total_exchange_gain
 
             # Group transactions by SAP part number for Excel sheet layout
             final_grouped = {}
@@ -737,22 +802,55 @@ class PartHistoryViewSet(viewsets.ViewSet):
                     # No negation needed - they come out positive from the formula
 
                 # Compute values for display and calculation
-                inr_val = float(txn.get('inr_value', 0) or 0)
-                fc_val = float(txn.get('fc_value', 0) or 0)
-                surcharge_num = surcharge if isinstance(surcharge, (int, float)) else 0
-                exchange_gain_num = exchange_gain if isinstance(exchange_gain, (int, float)) else 0
+                inr_val = round(float(txn.get('inr_value', 0) or 0), 2)
+                fc_val = round(float(txn.get('fc_value', 0) or 0), 2)
+                surcharge_num = round(float(surcharge), 2) if surcharge != '' else 0
+                exchange_gain_num = round(float(exchange_gain), 2) if exchange_gain != '' else 0
 
                 # For outgoing: negate INR Value and FC Value (goods going OUT = negative)
-                display_inr = -inr_val if txn['type'] == 'OUTGOING' else inr_val
-                display_fc = -fc_val if txn['type'] == 'OUTGOING' else fc_val
-                # Rate FC stays positive (per-unit rate is always positive)
-                display_rate_fc = abs(float(txn.get('rate_fc', 0) or 0)) if txn.get('rate_fc') else ''
+                display_inr = round(-inr_val if txn['type'] == 'OUTGOING' else inr_val, 2)
+                display_fc = round(-fc_val if txn['type'] == 'OUTGOING' else fc_val, 2)
+                # Rate FC stays positive (per-unit rate is always positive) and rounded to 2 decimals
+                display_rate_fc = round(abs(float(txn.get('rate_fc', 0) or 0)), 2) if txn.get('rate_fc') else ''
 
                 if txn['type'] == 'INCOMING':
-                    calculation = inr_val  # For incoming, Calculation = INR Value (positive)
+                    calculation = round(inr_val, 2)  # For incoming, Calculation = INR Value (positive)
                 else:
                     # For outgoing: (-INR) - (+Surcharge) - (+Exchange Gain) = -(incoming cost)
-                    calculation = display_inr - surcharge_num - exchange_gain_num
+                    # When surcharge and exchange gain are both 0 (bill-to-bill with matching rates),
+                    # use the incoming INR from consumption to ensure EXACT cancellation in closing.
+                    if surcharge_num == 0 and exchange_gain_num == 0:
+                        # Look up the incoming INR via consumption record
+                        entry_id = txn.get('invoice_entry_id')
+                        cons_inv_id = txn.get('consumption_invoice_id')
+                        incoming_inr = None
+                        if entry_id and cons_inv_id:
+                            c = consumption_by_key.get((entry_id, cons_inv_id))
+                            if c:
+                                inv = c.invoice
+                                c_qty = c.consumed_qty or 0
+                                inv_qty = inv.invoice_qty or inv.qty or 0
+                                # Prorate: if consumption is partial, scale the incoming INR
+                                if inv_qty > 0 and c_qty > 0:
+                                    full_inr = float(inv.inr_total or 0)
+                                    incoming_inr = round(full_inr * c_qty / inv_qty, 2)
+                        elif entry_id:
+                            cons_list = consumption_by_entry.get(entry_id, [])
+                            if len(cons_list) == 1:
+                                c = cons_list[0]
+                                inv = c.invoice
+                                c_qty = c.consumed_qty or 0
+                                inv_qty = inv.invoice_qty or inv.qty or 0
+                                if inv_qty > 0 and c_qty > 0:
+                                    full_inr = float(inv.inr_total or 0)
+                                    incoming_inr = round(full_inr * c_qty / inv_qty, 2)
+
+                        if incoming_inr is not None:
+                            calculation = round(-incoming_inr, 2)
+                        else:
+                            calculation = round(display_inr - surcharge_num - exchange_gain_num, 2)
+                    else:
+                        calculation = round(display_inr - surcharge_num - exchange_gain_num, 2)
 
                 final_grouped[p_num].append({
                     'Date': txn['date'],
@@ -763,10 +861,10 @@ class PartHistoryViewSet(viewsets.ViewSet):
                     'FC Value': display_fc if fc_val else '',
                     'Rate FC': display_rate_fc,
                     'INR Value': display_inr if inr_val else '',
-                    'Exchange Rate': txn.get('exchange_rate', ''),
+                    'Exchange Rate': round(float(txn.get('exchange_rate', 0) or 0), 2) if txn.get('exchange_rate') else '',
                     'On Hand': txn['on_hand'],
-                    'Surcharge': surcharge,
-                    'Exchange Gain': exchange_gain,
+                    'Surcharge': round(float(surcharge), 2) if surcharge != '' else '',
+                    'Exchange Gain': round(float(exchange_gain), 2) if exchange_gain != '' else '',
                     'Calculation': round(calculation, 2),
                     'Type': txn['type'],
                     '_calculation_raw': calculation,
@@ -776,9 +874,9 @@ class PartHistoryViewSet(viewsets.ViewSet):
             for p_num, rows in final_grouped.items():
                 running_balance = 0.0
                 for row in rows:
-                    calc_val = row.pop('_calculation_raw', 0)
-                    running_balance += calc_val
-                    row['Closing Balance Value'] = round(running_balance, 2)
+                    calc_val = round(row.pop('_calculation_raw', 0), 2)
+                    running_balance = round(running_balance + calc_val, 2)
+                    row['Closing Balance Value'] = running_balance
 
             # Create response
             response = HttpResponse(
@@ -1164,23 +1262,23 @@ class StockLedgerViewSet(viewsets.ViewSet):
                     part_grand_fill = PatternFill(start_color="FDEBD0", end_color="FDEBD0", fill_type="solid") # Light peach
 
                     # Column order matching Sheet 1 (Stock Ledger):
-                    # Identity → Opening → Shipment → Consumption (Despatch) → Closing
+                    # Identity -> Opening -> Shipment -> Consumption (Despatch) -> Closing
                     part_headers = [
-                        "Code No.", "Customer Name", "Part Number", "Invoice No.", "Invoice Date",
+                        "Code No.", "Customer Name", "Part Number", "Invoice No.", "Invoice Date", "Invoice Qty",
                         "Opening Qty", "Opening FC", "Opening INR",
                         "CCPL to WH Qty", "CCPL to WH FC Value", "CCPL to WH INR Value",
                         "WH to Customer Qty", "WH to Customer FC Value", "WH to Customer INR Value",
                         "Closing Qty", "Closing FC", "Closing INR",
                     ]
                     part_keys = [
-                        'Code No. Stock AC', 'Party Name', 'Part Number', 'Invoice No.', 'Invoice Date',
+                        'Code No. Stock AC', 'Party Name', 'Part Number', 'Invoice No.', 'Invoice Date', 'Invoice Qty',
                         'Opening Qty', 'Opening FC', 'Opening INR',
                         'Shipment Qty', 'Shipment FC', 'Shipment INR',
                         'Qty', 'FC Value', 'INR Value',
                         'Closing Qty', 'Closing FC', 'Closing INR',
                     ]
                     part_col_widths = [
-                        14, 25, 18, 18, 14,
+                        14, 25, 18, 18, 14, 14,
                         12, 14, 14,
                         12, 14, 14,
                         12, 14, 14,
@@ -1229,7 +1327,7 @@ class StockLedgerViewSet(viewsets.ViewSet):
                 else:
                     # Create empty sheet if no data
                     pd.DataFrame(columns=[
-                        "Code No.", "Customer Name", "Part Number", "Invoice No.", "Invoice Date",
+                        "Code No.", "Customer Name", "Part Number", "Invoice No.", "Invoice Date", "Invoice Qty",
                         "Opening Qty", "Opening FC", "Opening INR",
                         "CCPL to WH Qty", "CCPL to WH FC Value", "CCPL to WH INR Value",
                         "WH to Customer Qty", "WH to Customer FC Value", "WH to Customer INR Value",
@@ -1237,6 +1335,10 @@ class StockLedgerViewSet(viewsets.ViewSet):
                     ]).to_excel(writer, index=False, sheet_name="Part-Wise Tracking")
 
             # ── Auto-refresh PartWiseTracking DB table ──
+            # Set to False to freeze Power BI data during data cleanup operations.
+            # Set back to True when Power BI team is ready for updated data.
+            REFRESH_PARTWISE_TRACKING = True
+
             from sales.models import PartWiseTracking
 
             def _to_decimal_or_none(val):
@@ -1244,51 +1346,55 @@ class StockLedgerViewSet(viewsets.ViewSet):
                 if val == '' or val is None:
                     return None
                 try:
-                    return round(float(val), 4)
+                    return round(float(val), 2)
                 except (TypeError, ValueError):
                     return None
 
-            try:
-                # Clear existing records and bulk-insert fresh data
-                PartWiseTracking.objects.all().delete()
+            if REFRESH_PARTWISE_TRACKING:
+                try:
+                    # Clear existing records and bulk-insert fresh data
+                    PartWiseTracking.objects.all().delete()
 
-                if partwise_data:
-                    rows_to_create = []
-                    for row_data in partwise_data:
-                        row_type = row_data.get('_row_type', '')
-                        if row_type not in ('customer_subtotal', 'invoice_detail', 'part_grand_total'):
-                            continue  # Skip headers, spacers
+                    if partwise_data:
+                        rows_to_create = []
+                        for row_data in partwise_data:
+                            row_type = row_data.get('_row_type', '')
+                            if row_type not in ('customer_subtotal', 'invoice_detail', 'part_grand_total'):
+                                continue  # Skip headers, spacers
 
-                        rows_to_create.append(PartWiseTracking(
-                            row_type=row_type,
-                            customer_code=row_data.get('Code No. Stock AC', '') or '',
-                            customer_name=(row_data.get('Party Name', '') or '').replace(' — Subtotal', ''),
-                            part_number=row_data.get('Part Number', '') or '',
-                            invoice_number=row_data.get('Invoice No.', '') or '',
-                            invoice_date=row_data.get('Invoice Date', '') or '',
-                            opening_qty=_to_decimal_or_none(row_data.get('Opening Qty')),
-                            opening_fc=_to_decimal_or_none(row_data.get('Opening FC')),
-                            opening_inr=_to_decimal_or_none(row_data.get('Opening INR')),
-                            ccpl_to_wh_qty=_to_decimal_or_none(row_data.get('Shipment Qty')),
-                            ccpl_to_wh_fc=_to_decimal_or_none(row_data.get('Shipment FC')),
-                            ccpl_to_wh_inr=_to_decimal_or_none(row_data.get('Shipment INR')),
-                            wh_to_customer_qty=_to_decimal_or_none(row_data.get('Qty')),
-                            wh_to_customer_fc=_to_decimal_or_none(row_data.get('FC Value')),
-                            wh_to_customer_inr=_to_decimal_or_none(row_data.get('INR Value')),
-                            closing_qty=_to_decimal_or_none(row_data.get('Closing Qty')),
-                            closing_fc=_to_decimal_or_none(row_data.get('Closing FC')),
-                            closing_inr=_to_decimal_or_none(row_data.get('Closing INR')),
-                            from_date=from_date,
-                            to_date=to_date,
-                        ))
+                            rows_to_create.append(PartWiseTracking(
+                                row_type=row_type,
+                                customer_code=row_data.get('Code No. Stock AC', '') or '',
+                                customer_name=(row_data.get('Party Name', '') or '').replace(' — Subtotal', ''),
+                                part_number=row_data.get('Part Number', '') or '',
+                                invoice_number=row_data.get('Invoice No.', '') or '',
+                                invoice_date=row_data.get('Invoice Date', '') or '',
+                                invoice_qty=_to_decimal_or_none(row_data.get('Invoice Qty')),
+                                opening_qty=_to_decimal_or_none(row_data.get('Opening Qty')),
+                                opening_fc=_to_decimal_or_none(row_data.get('Opening FC')),
+                                opening_inr=_to_decimal_or_none(row_data.get('Opening INR')),
+                                ccpl_to_wh_qty=_to_decimal_or_none(row_data.get('Shipment Qty')),
+                                ccpl_to_wh_fc=_to_decimal_or_none(row_data.get('Shipment FC')),
+                                ccpl_to_wh_inr=_to_decimal_or_none(row_data.get('Shipment INR')),
+                                wh_to_customer_qty=_to_decimal_or_none(row_data.get('Qty')),
+                                wh_to_customer_fc=_to_decimal_or_none(row_data.get('FC Value')),
+                                wh_to_customer_inr=_to_decimal_or_none(row_data.get('INR Value')),
+                                closing_qty=_to_decimal_or_none(row_data.get('Closing Qty')),
+                                closing_fc=_to_decimal_or_none(row_data.get('Closing FC')),
+                                closing_inr=_to_decimal_or_none(row_data.get('Closing INR')),
+                                from_date=from_date,
+                                to_date=to_date,
+                            ))
 
-                    if rows_to_create:
-                        PartWiseTracking.objects.bulk_create(rows_to_create)
-                        logger.info(f"PartWiseTracking table refreshed: {len(rows_to_create)} rows created")
+                        if rows_to_create:
+                            PartWiseTracking.objects.bulk_create(rows_to_create)
+                            logger.info(f"PartWiseTracking table refreshed: {len(rows_to_create)} rows created")
 
-            except Exception as refresh_err:
-                # Don't fail the export if the DB refresh fails
-                logger.error(f"Error refreshing PartWiseTracking table: {refresh_err}")
+                except Exception as refresh_err:
+                    # Don't fail the export if the DB refresh fails
+                    logger.error(f"Error refreshing PartWiseTracking table: {refresh_err}")
+            else:
+                logger.info("PartWiseTracking refresh SKIPPED (REFRESH_PARTWISE_TRACKING = False)")
 
             return response
 

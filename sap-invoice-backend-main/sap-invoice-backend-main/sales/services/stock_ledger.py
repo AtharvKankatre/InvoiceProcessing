@@ -8,10 +8,11 @@ from retail.models import InvoiceEntry
 class StockLedgerService:
 
     @staticmethod
-    def _get_hybrid_outgoing(entry_qs):
+    def _get_hybrid_outgoing(entry_qs, consumption_cutoff_date=None):
         """
-        Calculate outgoing qty/fc/inr using InvoiceEntryConsumption where
-        available, falling back to raw InvoiceEntry values otherwise.
+        Calculate outgoing qty/fc/inr using entry-based values (usd_total, inr_total)
+        to match Part History export. Uses consumption records only for qty tracking
+        and cutoff-date filtering (opening balance calculations).
         Plating charges are subtracted from FC/INR to reflect actual part values.
         Returns (total_qty, total_fc, total_inr).
         """
@@ -25,24 +26,47 @@ class StockLedgerService:
             entry_qty = 0
 
             cons = entry.consumptions.all()
-            if cons.exists():
+            if cons.exists() and consumption_cutoff_date:
+                # Opening balance: need to filter by cutoff date
+                # Use consumption qty for filtering, but entry FC/INR (prorated)
+                total_entry_consumed_qty = sum(c.consumed_qty or 0 for c in cons)
+                valid_consumed_qty = 0
+
                 for c in cons:
-                    entry_qty += c.consumed_qty or 0
-                    total_fc += c.fc_value or Decimal(0)
-                total_inr += entry.inr_total or Decimal(0)
+                    if c.invoice.date >= consumption_cutoff_date:
+                        continue
+                    cq = c.consumed_qty or 0
+                    valid_consumed_qty += cq
+                    entry_qty += cq
+
+                # Prorate entry FC/INR based on valid consumption ratio
+                if total_entry_consumed_qty > 0 and valid_consumed_qty > 0:
+                    entry_fc = entry.usd_total or Decimal(0)
+                    entry_inr = entry.inr_total or Decimal(0)
+                    ratio = Decimal(str(valid_consumed_qty)) / Decimal(str(total_entry_consumed_qty))
+                    total_fc += round(entry_fc * ratio, 2)
+                    total_inr += round(entry_inr * ratio, 2)
+                elif total_entry_consumed_qty > 0 and valid_consumed_qty == 0:
+                    # ALL consumptions are after the cutoff date, but the entry
+                    # itself shipped before the period. Fall back to entry values
+                    # so its outgoing value is not silently dropped.
+                    entry_qty = entry.qty or 0
+                    total_fc += round(entry.usd_total or Decimal(0), 2)
+                    total_inr += round(entry.inr_total or Decimal(0), 2)
             else:
+                # Period calculation or no consumption: use entry values directly
                 entry_qty = entry.qty or 0
-                total_fc += entry.usd_total or Decimal(0)
-                total_inr += entry.inr_total or Decimal(0)
+                total_fc += round(entry.usd_total or Decimal(0), 2)
+                total_inr += round(entry.inr_total or Decimal(0), 2)
 
             total_qty += entry_qty
 
             # Subtract plating from FC/INR (plating is a service, not stock)
-            if plating:
-                total_fc -= plating * entry_qty
-                total_inr -= plating * entry_conv * entry_qty
+            if plating and entry_qty > 0:
+                total_fc -= round(plating * entry_qty, 2)
+                total_inr -= round(plating * entry_conv * entry_qty, 2)
 
-        return total_qty, total_fc, total_inr
+        return total_qty, round(total_fc, 2), round(total_inr, 2)
 
     @staticmethod
     def _get_cost_adjustments(entry_qs):
@@ -66,25 +90,46 @@ class StockLedgerService:
 
         for c in consumptions:
             inv = c.invoice              # Incoming (warehouse) invoice
+            
             entry = c.invoice_entry      # Outgoing (retail) entry
             consumed_qty = c.consumed_qty or 0
 
-            inv_dollar_rate = inv.dollar_rate or Decimal(0)
-            entry_usd_rate = entry.usd_rate or Decimal(0)
-            plating = entry.plating_charges or Decimal(0)
+            # Round to 2 decimal places to prevent micro-discrepancies between
+            # Sap's 15-decimal precision and the user's manual 2-decimal Excel entry
+            inv_dollar_rate = round(inv.dollar_rate or Decimal(0), 2)
+            entry_usd_rate = round(entry.usd_rate or Decimal(0), 2)
+            plating = round(entry.plating_charges or Decimal(0), 2)
             adjusted_usd_rate = entry_usd_rate - plating
-            inv_conversion_rate = inv.conversion_rate or Decimal(0)
-            entry_conversion_rate = entry.conversion_rate or Decimal(0)
 
-            # Surcharge FC = (incoming FC rate - adjusted selling FC rate) * qty
-            s_fc = (inv_dollar_rate - adjusted_usd_rate) * consumed_qty
-            surcharge_fc += s_fc
+            inv_conversion_rate = round(inv.conversion_rate or Decimal(0), 2)
+            entry_conversion_rate = round(entry.conversion_rate or Decimal(0), 2)
 
-            # Surcharge INR = surcharge_fc * incoming exchange rate
-            surcharge_inr += s_fc * inv_conversion_rate
-
-            # Exchange Gain = (incoming ER - selling ER) * qty * adjusted selling FC rate
-            exchange_gain_inr += (inv_conversion_rate - entry_conversion_rate) * consumed_qty * adjusted_usd_rate
+            # To ensure the closing balance cancels out EXACTLY, we must ensure:
+            # entry_inr + surcharge_inr + exchange_gain_inr == incoming_inr
+            # So we calculate the exact raw difference from the original totals
+            inv_qty = inv.invoice_qty or inv.qty or 0
+            if inv_qty > 0 and consumed_qty > 0:
+                ratio = Decimal(str(consumed_qty)) / Decimal(str(inv_qty))
+                exact_incoming_inr = round((inv.inr_total or Decimal(0)) * ratio, 2)
+                raw_entry_inr = round((entry.inr_total or Decimal(0)) * Decimal(str(consumed_qty)) / Decimal(str(entry.qty or consumed_qty)), 2)
+                plating_inr = round(plating * entry_conversion_rate * consumed_qty, 2)
+                exact_entry_inr = raw_entry_inr - plating_inr
+                
+                # Surcharge FC = (incoming FC rate - adjusted selling FC rate) * qty
+                s_fc = (inv_dollar_rate - adjusted_usd_rate) * consumed_qty
+                surcharge_fc += s_fc
+                
+                # If rates are perfectly matched (bill-to-bill), force surcharge and exchange to absorb the exact rounding diff
+                if s_fc == 0 and inv_conversion_rate == entry_conversion_rate:
+                    surcharge_inr += Decimal(0)
+                    exchange_gain_inr += (exact_incoming_inr - exact_entry_inr)
+                else:
+                    # Regular calculation
+                    calc_surcharge_inr = Decimal(str(round(s_fc * inv_conversion_rate, 2)))
+                    calc_exchange_inr = Decimal(str(round((inv_conversion_rate - entry_conversion_rate) * consumed_qty * adjusted_usd_rate, 2)))
+                    
+                    surcharge_inr += calc_surcharge_inr
+                    exchange_gain_inr += calc_exchange_inr
 
         return surcharge_fc, surcharge_inr, exchange_gain_inr
 
@@ -157,17 +202,24 @@ class StockLedgerService:
                 )
                 
                 # Outgoing (Subtract) — hybrid: prefer consumption data
-                retail_parts = InvoiceRetailPartMap.objects.filter(company_name=party_name).values_list('retail_part_number', flat=True)
+                mappings = InvoiceRetailPartMap.objects.filter(company_name=party_name)
+                all_parts = list(set(
+                    list(mappings.values_list('retail_part_number', flat=True)) +
+                    [p for p in mappings.values_list('sale_part_number', flat=True) if p]
+                ))
                 out_entries = InvoiceEntry.objects.filter(
-                    part_number__in=retail_parts,
+                    part_number__in=all_parts,
                     date__lt=start_date
-                ).prefetch_related('consumptions')
-                out_qty, out_fc, out_inr = StockLedgerService._get_hybrid_outgoing(out_entries)
+                ).prefetch_related('consumptions', 'consumptions__invoice')
+                out_qty, out_fc, out_inr = StockLedgerService._get_hybrid_outgoing(out_entries, consumption_cutoff_date=start_date)
+                
+                # Subtract surcharge and exchange gain from opening balance
+                open_surcharge_fc, open_surcharge_inr, open_exchange_inr = StockLedgerService._get_cost_adjustments(out_entries)
                 
                 # Net Opening
                 opening_qty = (incoming_opening['total_qty'] or 0) - out_qty
-                opening_fc_val = (incoming_opening['total_fc'] or Decimal(0)) - out_fc
-                opening_inr_val = (incoming_opening['total_inr'] or Decimal(0)) - out_inr
+                opening_fc_val = (incoming_opening['total_fc'] or Decimal(0)) - out_fc - open_surcharge_fc
+                opening_inr_val = (incoming_opening['total_inr'] or Decimal(0)) - out_inr - open_surcharge_inr - open_exchange_inr
 
             # --- PERIOD TRANSACTIONS ---
             # Filter by date range (inclusive)
@@ -188,10 +240,14 @@ class StockLedgerService:
             )
 
             # Outgoing (Despatch to Customer) — hybrid: prefer consumption data
-            retail_parts = InvoiceRetailPartMap.objects.filter(company_name=party_name).values_list('retail_part_number', flat=True)
+            mappings = InvoiceRetailPartMap.objects.filter(company_name=party_name)
+            all_parts = list(set(
+                list(mappings.values_list('retail_part_number', flat=True)) +
+                [p for p in mappings.values_list('sale_part_number', flat=True) if p]
+            ))
             
             outgoing_period_filter = {
-                'part_number__in': retail_parts
+                'part_number__in': all_parts
             }
             if start_date:
                 outgoing_period_filter['date__gte'] = start_date
@@ -200,7 +256,7 @@ class StockLedgerService:
                 
             out_entries = InvoiceEntry.objects.filter(
                 **outgoing_period_filter
-            ).prefetch_related('consumptions')
+            ).prefetch_related('consumptions', 'consumptions__invoice')
             out_qty, out_fc, out_inr = StockLedgerService._get_hybrid_outgoing(out_entries)
 
             # Get surcharge and exchange gain for outgoing entries
@@ -230,20 +286,20 @@ class StockLedgerService:
                     "Code No. Stock AC": party_code,
                     "Party Name": party_name,
                     "Opening Stock Qty": opening_qty,
-                    "Opening Stock FC Value": opening_fc_val,
-                    "Opening Stock INR Value": opening_inr_val,
+                    "Opening Stock FC Value": round(float(opening_fc_val), 2),
+                    "Opening Stock INR Value": round(float(opening_inr_val), 2),
                     
                     "Shipment to WH (Add) Qty": inc_qty,
-                    "Shipment to WH (Add) FC": inc_fc,
-                    "Shipment to WH (Add) INR": inc_inr,
+                    "Shipment to WH (Add) FC": round(float(inc_fc), 2),
+                    "Shipment to WH (Add) INR": round(float(inc_inr), 2),
                     
                     "Despatch (Less) Qty": out_qty,
-                    "Despatch (Less) FC": out_fc,
-                    "Despatch (Less) INR": out_inr,
+                    "Despatch (Less) FC": round(float(out_fc), 2),
+                    "Despatch (Less) INR": round(float(out_inr), 2),
                     
                     "Closing Stock Qty": closing_qty,
-                    "Closing Stock FC Value": closing_fc_val,
-                    "Closing Stock INR Value": closing_inr_val,
+                    "Closing Stock FC Value": round(float(closing_fc_val), 2),
+                    "Closing Stock INR Value": round(float(closing_inr_val), 2),
                 })
 
         return report_data
@@ -293,13 +349,15 @@ class StockLedgerService:
             if name not in party_code_map or (not party_code_map[name] and code):
                 party_code_map[name] = code
 
-        # Build part → company mapping
+        # Build part → company mapping (include BOTH retail and sale part numbers)
         retail_to_company = {}
         for pm in InvoiceRetailPartMap.objects.all():
             retail_to_company[pm.retail_part_number] = pm.company_name
+            if pm.sale_part_number:
+                retail_to_company[pm.sale_part_number] = pm.company_name
 
         # Get all entries in period with consumptions prefetched
-        entries = InvoiceEntry.objects.filter(**date_filter).prefetch_related('consumptions').order_by('date')
+        entries = InvoiceEntry.objects.filter(**date_filter).prefetch_related('consumptions', 'consumptions__invoice').order_by('date')
 
         # Group entries by company
         company_entries = {}
@@ -331,16 +389,24 @@ class StockLedgerService:
                     fc=Coalesce(Sum('dollar_total'), Decimal(0), output_field=DecimalField()),
                     inr=Coalesce(Sum('inr_total'), Decimal(0), output_field=DecimalField()),
                 )
-                retail_parts = InvoiceRetailPartMap.objects.filter(
+                mappings = InvoiceRetailPartMap.objects.filter(
                     company_name=party_name
-                ).values_list('retail_part_number', flat=True)
+                )
+                all_parts = list(set(
+                    list(mappings.values_list('retail_part_number', flat=True)) +
+                    [p for p in mappings.values_list('sale_part_number', flat=True) if p]
+                ))
                 out_entries = InvoiceEntry.objects.filter(
-                    part_number__in=retail_parts, date__lt=start_date
-                ).prefetch_related('consumptions')
-                out_qty, out_fc, out_inr = StockLedgerService._get_hybrid_outgoing(out_entries)
+                    part_number__in=all_parts, date__lt=start_date
+                ).prefetch_related('consumptions', 'consumptions__invoice')
+                out_qty, out_fc, out_inr = StockLedgerService._get_hybrid_outgoing(out_entries, consumption_cutoff_date=start_date)
+                
+                # Subtract surcharge and exchange gain from opening balance
+                open_surcharge_fc, open_surcharge_inr, open_exchange_inr = StockLedgerService._get_cost_adjustments(out_entries)
+                
                 opening_qty = (inc_open['qty'] or 0) - out_qty
-                opening_fc = (inc_open['fc'] or Decimal(0)) - out_fc
-                opening_inr = (inc_open['inr'] or Decimal(0)) - out_inr
+                opening_fc = (inc_open['fc'] or Decimal(0)) - out_fc - open_surcharge_fc
+                opening_inr = (inc_open['inr'] or Decimal(0)) - out_inr - open_surcharge_inr - open_exchange_inr
 
             # --- Calculate Shipment (Incoming) in period ---
             inc_filter = {'customer_name': party_name}
@@ -385,14 +451,14 @@ class StockLedgerService:
                 'INR Value': '',
                 'Date': '',
                 'Opening Qty': opening_qty,
-                'Opening FC': float(opening_fc),
-                'Opening INR': float(opening_inr),
+                'Opening FC': round(float(opening_fc), 2),
+                'Opening INR': round(float(opening_inr), 2),
                 'Shipment Qty': ship_qty,
-                'Shipment FC': float(ship_fc),
-                'Shipment INR': float(ship_inr),
+                'Shipment FC': round(float(ship_fc), 2),
+                'Shipment INR': round(float(ship_inr), 2),
                 'Closing Qty': closing_qty,
-                'Closing FC': float(closing_fc),
-                'Closing INR': float(closing_inr),
+                'Closing FC': round(float(closing_fc), 2),
+                'Closing INR': round(float(closing_inr), 2),
             })
 
             # --- SUB-GROUP ENTRIES BY PART NUMBER ---
@@ -416,7 +482,7 @@ class StockLedgerService:
                     entry_conv = entry.conversion_rate or Decimal(0)
                     if cons.exists():
                         entry_qty = sum(c.consumed_qty or 0 for c in cons)
-                        entry_fc = float(sum(c.fc_value or Decimal(0) for c in cons))
+                        entry_fc = float(entry.usd_total or 0)
                         entry_inr = float(entry.inr_total or 0)
                     else:
                         entry_qty = entry.qty
@@ -433,8 +499,8 @@ class StockLedgerService:
                         'Party Name': party_name,
                         'Part Number': entry.part_number,
                         'Qty': entry_qty,
-                        'FC Value': entry_fc,
-                        'INR Value': entry_inr,
+                        'FC Value': round(entry_fc, 2),
+                        'INR Value': round(entry_inr, 2),
                         'Date': entry.date.strftime("%d-%m-%Y") if entry.date else "",
                         'Opening Qty': '',
                         'Opening FC': '',
@@ -476,8 +542,8 @@ class StockLedgerService:
                 'Party Name': f'{party_name} — Despatch Total',
                 'Part Number': '',
                 'Qty': desp_qty,
-                'FC Value': float(desp_fc),
-                'INR Value': float(desp_inr),
+                'FC Value': round(float(desp_fc), 2),
+                'INR Value': round(float(desp_inr), 2),
                 'Date': '',
                 'Opening Qty': '',
                 'Opening FC': '',
@@ -486,8 +552,8 @@ class StockLedgerService:
                 'Shipment FC': '',
                 'Shipment INR': '',
                 'Closing Qty': closing_qty,
-                'Closing FC': float(closing_fc),
-                'Closing INR': float(closing_inr),
+                'Closing FC': round(float(closing_fc), 2),
+                'Closing INR': round(float(closing_inr), 2),
             })
 
         return result_rows
@@ -530,6 +596,15 @@ class StockLedgerService:
             retail_to_company[pm.retail_part_number] = pm.company_name
             if pm.sale_part_number:
                 retail_to_sale_part[pm.retail_part_number] = pm.sale_part_number
+                
+                # Also map the sale part number to the company in case Cooper uploads the sale part 
+                # instead of the retail part in the outgoing invoices
+                if pm.sale_part_number not in retail_to_company:
+                    retail_to_company[pm.sale_part_number] = pm.company_name
+                # And map sale part to itself to safely resolve canonical names
+                if pm.sale_part_number not in retail_to_sale_part:
+                    retail_to_sale_part[pm.sale_part_number] = pm.sale_part_number
+                
             if pm.customer_code:
                 company_to_code[pm.company_name] = pm.customer_code
                 
@@ -538,7 +613,7 @@ class StockLedgerService:
             if name not in company_to_code and c['customer_code']:
                 company_to_code[name] = c['customer_code']
 
-        entries = InvoiceEntry.objects.filter(**date_filter).prefetch_related('consumptions').order_by('date')
+        entries = InvoiceEntry.objects.filter(**date_filter).prefetch_related('consumptions', 'consumptions__invoice').order_by('date')
         
         inc_filter = {}
         if start_date:
@@ -557,6 +632,7 @@ class StockLedgerService:
             
         opening_inc = {}
         opening_out = {}
+        opening_adj = {}  # surcharge/exchange adjustments per (part, customer)
         if start_date:
             prev_inc = Invoice.objects.filter(date__lt=start_date).values('part_number', 'customer_name').annotate(
                 qty=Coalesce(Sum(Coalesce(NullIf(F('invoice_qty'), Value(0)), F('qty'))), 0),
@@ -569,42 +645,28 @@ class StockLedgerService:
                 opening_inc[(part, cust)] = p
                 all_parts.add(part)
                 
-            # Opening outgoing — hybrid: prefer consumption data
-            prev_out_entries = InvoiceEntry.objects.filter(date__lt=start_date).prefetch_related('consumptions')
+            # Opening outgoing — use the SAME helpers as Sheet 1 (get_ledger_data)
+            # Group pre-period entries by (canonical_part, customer)
+            prev_out_entries = InvoiceEntry.objects.filter(date__lt=start_date).prefetch_related('consumptions', 'consumptions__invoice')
+            grouped_entries = {}
             for entry in prev_out_entries:
                 retail_part = entry.part_number
                 canonical = retail_to_sale_part.get(retail_part, retail_part)
                 cust = retail_to_company.get(retail_part, "Unknown")
-                plating = entry.plating_charges or Decimal(0)
-                entry_conv = entry.conversion_rate or Decimal(0)
-                
-                cons = entry.consumptions.all()
-                if cons.exists():
-                    entry_qty = 0
-                    for c in cons:
-                        if (canonical, cust) not in opening_out:
-                            opening_out[(canonical, cust)] = {'qty': 0, 'fc': Decimal(0), 'inr': Decimal(0)}
-                        cq = c.consumed_qty or 0
-                        entry_qty += cq
-                        opening_out[(canonical, cust)]['qty'] += cq
-                        opening_out[(canonical, cust)]['fc'] += c.fc_value or Decimal(0)
-                    if (canonical, cust) not in opening_out:
-                        opening_out[(canonical, cust)] = {'qty': 0, 'fc': Decimal(0), 'inr': Decimal(0)}
-                    opening_out[(canonical, cust)]['inr'] += entry.inr_total or Decimal(0)
-                    if plating:
-                        opening_out[(canonical, cust)]['fc'] -= plating * entry_qty
-                        opening_out[(canonical, cust)]['inr'] -= plating * entry_conv * entry_qty
-                else:
-                    if (canonical, cust) not in opening_out:
-                        opening_out[(canonical, cust)] = {'qty': 0, 'fc': Decimal(0), 'inr': Decimal(0)}
-                    eq = entry.qty or 0
-                    opening_out[(canonical, cust)]['qty'] += eq
-                    opening_out[(canonical, cust)]['fc'] += entry.usd_total or Decimal(0)
-                    opening_out[(canonical, cust)]['inr'] += entry.inr_total or Decimal(0)
-                    if plating:
-                        opening_out[(canonical, cust)]['fc'] -= plating * eq
-                        opening_out[(canonical, cust)]['inr'] -= plating * entry_conv * eq
+                if (canonical, cust) not in grouped_entries:
+                    grouped_entries[(canonical, cust)] = []
+                grouped_entries[(canonical, cust)].append(entry)
                 all_parts.add(canonical)
+            
+            # Calculate opening outgoing and adjustments using the SAME helpers as Sheet 1
+            for (part, cust), entries_list in grouped_entries.items():
+                out_qty, out_fc, out_inr = StockLedgerService._get_hybrid_outgoing(
+                    entries_list, consumption_cutoff_date=start_date
+                )
+                opening_out[(part, cust)] = {'qty': out_qty, 'fc': out_fc, 'inr': out_inr}
+                
+                s_fc, s_inr, e_inr = StockLedgerService._get_cost_adjustments(entries_list)
+                opening_adj[(part, cust)] = {'s_fc': s_fc, 's_inr': s_inr, 'e_inr': e_inr}
 
         period_inc = {}
         period_inc_qs = Invoice.objects.filter(**inc_filter).values('part_number', 'customer_name').annotate(
@@ -679,8 +741,9 @@ class StockLedgerService:
                 o_out = opening_out.get((part, cust), {'qty': 0, 'fc': Decimal(0), 'inr': Decimal(0)})
                 
                 open_qty = (o_inc['qty'] or 0) - (o_out['qty'] or 0)
-                open_fc = (o_inc['fc'] or Decimal(0)) - (o_out['fc'] or Decimal(0))
-                open_inr = (o_inc['inr'] or Decimal(0)) - (o_out['inr'] or Decimal(0))
+                o_adj = opening_adj.get((part, cust), {'s_fc': Decimal(0), 's_inr': Decimal(0), 'e_inr': Decimal(0)})
+                open_fc = (o_inc['fc'] or Decimal(0)) - (o_out['fc'] or Decimal(0)) - o_adj['s_fc']
+                open_inr = (o_inc['inr'] or Decimal(0)) - (o_out['inr'] or Decimal(0)) - o_adj['s_inr'] - o_adj['e_inr']
                 
                 p_inc = period_inc.get((part, cust), {'qty': 0, 'fc': Decimal(0), 'inr': Decimal(0)})
                 ship_qty = p_inc['qty'] or 0
@@ -729,8 +792,8 @@ class StockLedgerService:
                 
                 if start_date:
                     open_qty_val = open_qty
-                    open_fc_val = float(open_fc)
-                    open_inr_val = float(open_inr)
+                    open_fc_val = round(float(open_fc), 2)
+                    open_inr_val = round(float(open_inr), 2)
                 else:
                     open_qty_val = ''
                     open_fc_val = ''
@@ -744,18 +807,18 @@ class StockLedgerService:
                     'Invoice No.': '',
                     'Invoice Date': '',
                     'Qty': desp_qty,
-                    'FC Value': float(desp_fc),
-                    'INR Value': float(desp_inr),
+                    'FC Value': round(float(desp_fc), 2),
+                    'INR Value': round(float(desp_inr), 2),
                     'Date': '',
                     'Opening Qty': open_qty_val,
                     'Opening FC': open_fc_val,
                     'Opening INR': open_inr_val,
                     'Shipment Qty': ship_qty,
-                    'Shipment FC': float(ship_fc),
-                    'Shipment INR': float(ship_inr),
+                    'Shipment FC': round(float(ship_fc), 2),
+                    'Shipment INR': round(float(ship_inr), 2),
                     'Closing Qty': close_qty,
-                    'Closing FC': float(close_fc),
-                    'Closing INR': float(close_inr),
+                    'Closing FC': round(float(close_fc), 2),
+                    'Closing INR': round(float(close_inr), 2),
                 })
 
                 # --- INVOICE-LEVEL CLOSING BREAKDOWN ---
@@ -793,6 +856,7 @@ class StockLedgerService:
                             'Part Number': part,
                             'Invoice No.': inv.invoice_number,
                             'Invoice Date': inv.date.strftime("%d-%m-%Y") if inv.date else '',
+                            'Invoice Qty': inv_qty,
                             'Qty': '',
                             'FC Value': '',
                             'INR Value': '',
@@ -811,8 +875,8 @@ class StockLedgerService:
             # Determine Opening values for Grand Total
             if start_date:
                 gt_open_qty = part_grand_open_qty
-                gt_open_fc = float(part_grand_open_fc)
-                gt_open_inr = float(part_grand_open_inr)
+                gt_open_fc = round(float(part_grand_open_fc), 2)
+                gt_open_inr = round(float(part_grand_open_inr), 2)
             else:
                 gt_open_qty = ''
                 gt_open_fc = ''
@@ -826,18 +890,18 @@ class StockLedgerService:
                 'Invoice No.': '',
                 'Invoice Date': '',
                 'Qty': part_grand_desp_qty,
-                'FC Value': float(part_grand_desp_fc),
-                'INR Value': float(part_grand_desp_inr),
+                'FC Value': round(float(part_grand_desp_fc), 2),
+                'INR Value': round(float(part_grand_desp_inr), 2),
                 'Date': '',
                 'Opening Qty': gt_open_qty,
                 'Opening FC': gt_open_fc,
                 'Opening INR': gt_open_inr,
                 'Shipment Qty': part_grand_ship_qty,
-                'Shipment FC': float(part_grand_ship_fc),
-                'Shipment INR': float(part_grand_ship_inr),
+                'Shipment FC': round(float(part_grand_ship_fc), 2),
+                'Shipment INR': round(float(part_grand_ship_inr), 2),
                 'Closing Qty': part_grand_close_qty,
-                'Closing FC': float(part_grand_close_fc),
-                'Closing INR': float(part_grand_close_inr),
+                'Closing FC': round(float(part_grand_close_fc), 2),
+                'Closing INR': round(float(part_grand_close_inr), 2),
             })
             
             # Spacer row

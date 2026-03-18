@@ -1,0 +1,34 @@
+Generating Stock Ledger (Sheet 1)...
+Generating Part-Wise Tracking (Sheet 3)...
+
+=== COMPARING SH1 vs SH3 ===
+MISMATCH FOR: CUST
+  SH1 (Stock Ledger): QTY=5, FC=0.0, INR=0.0
+  SH3 (Part-Wise):    QTY=0, FC=0, INR=0
+MISMATCH FOR: CUST — Subtotal
+  SH1 (Stock Ledger): QTY=0, FC=0, INR=0
+  SH3 (Part-Wise):    QTY=5, FC=0.0, INR=0.0
+MISMATCH FOR: Cooper Corp
+  SH1 (Stock Ledger): QTY=650, FC=17800.0, INR=1442462.5
+  SH3 (Part-Wise):    QTY=0, FC=0, INR=0
+MISMATCH FOR: Cooper Corp — Subtotal
+  SH1 (Stock Ledger): QTY=0, FC=0, INR=0
+  SH3 (Part-Wise):    QTY=650, FC=17800.0, INR=1442462.5
+MISMATCH FOR: Honda
+  SH1 (Stock Ledger): QTY=650, FC=29875.0, INR=2477862.5
+  SH3 (Part-Wise):    QTY=0, FC=0, INR=0
+MISMATCH FOR: Honda — Subtotal
+  SH1 (Stock Ledger): QTY=0, FC=0, INR=0
+  SH3 (Part-Wise):    QTY=650, FC=29875.0, INR=2477862.5
+MISMATCH FOR: Hyundai
+  SH1 (Stock Ledger): QTY=800, FC=25200.0, INR=2087500.0
+  SH3 (Part-Wise):    QTY=0, FC=0, INR=0
+MISMATCH FOR: Hyundai — Subtotal
+  SH1 (Stock Ledger): QTY=0, FC=0, INR=0
+  SH3 (Part-Wise):    QTY=800, FC=25200.0, INR=2087500.0
+MISMATCH FOR: Kawasaki
+  SH1 (Stock Ledger): QTY=350, FC=16700.0, INR=1394450.0
+  SH3 (Part-Wise):    QTY=0, FC=0, INR=0
+MISMATCH FOR: Kawasaki — Subtotal
+  SH1 (Stock Ledger): QTY=0, FC=0, INR=0
+  SH3 (Part-Wise):    QTY=350, FC=16700.0, INR=1394450.0
